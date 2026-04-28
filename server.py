@@ -203,6 +203,9 @@ class GenerationTaskManager:
         try:
             await self.send_stream_payload(**kwargs)
             return True
+        except (WebSocketDisconnect, RuntimeError) as exc:
+            print(f"Failed to send payload: {type(exc).__name__}: {exc}")
+            return False
         except Exception as exc:
             print(f"Failed to send payload: {type(exc).__name__}: {exc}")
             return False
@@ -215,7 +218,13 @@ async def editor_websocket(websocket: WebSocket) -> None:
 
     try:
         while True:
-            raw_payload = await websocket.receive_json()
+            try:
+                raw_payload = await websocket.receive_json()
+            except (RuntimeError, WebSocketDisconnect):
+                # RuntimeError: race condition, socket not ready despite accept() call
+                # WebSocketDisconnect: client disconnected before sending data
+                break
+
             try:
                 payload = EditorPayload.parse_obj(raw_payload)
             except ValidationError as exc:
