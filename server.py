@@ -15,8 +15,8 @@ from typing import Any, Iterator, Literal, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Extra, ValidationError
 
+from engine import get_engine
 from editor_state_manager import EditorStateManager
-from mock_engine import MockExLlamaV2Engine
 
 
 class EditorPayload(BaseModel):
@@ -43,7 +43,7 @@ app = FastAPI(title="Phase 3 Editor WebSocket Server")
 
 
 def create_state_manager() -> EditorStateManager:
-    engine = MockExLlamaV2Engine()
+    engine = get_engine()
     manager = EditorStateManager(engine=engine)
     manager.initialize("")
     return manager
@@ -52,23 +52,6 @@ def create_state_manager() -> EditorStateManager:
 # Global for Phase 3. The connection handler still serializes access with a
 # lock so later multi-client work can move this to connection scope cleanly.
 state_manager = create_state_manager()
-
-
-def _blocking_token_generator(
-    action: Literal["autocomplete", "rewrite"],
-    cancel_event: asyncio.Event,
-) -> Iterator[str]:
-    """Synchronous token source that mirrors Phase 4's blocking CUDA calls."""
-    token_count = 50 if action == "autocomplete" else 80
-    token = " word" if action == "autocomplete" else " rewritten"
-
-    for _ in range(token_count):
-        if cancel_event.is_set():
-            break
-        time.sleep(0.05)
-        if cancel_event.is_set():
-            break
-        yield token
 
 
 def _next_token(token_iterator: Iterator[str]) -> Optional[str]:
@@ -153,10 +136,11 @@ class GenerationTaskManager:
         cancelled = False
 
         try:
+            max_new_tokens = 50 if payload.action == "autocomplete" else 80
             token_iterator = await asyncio.to_thread(
-                _blocking_token_generator,
-                payload.action,
+                self.manager.engine.generate_stream,
                 cancel_event,
+                max_new_tokens,
             )
             while not cancel_event.is_set():
                 token = await asyncio.to_thread(_next_token, token_iterator)
