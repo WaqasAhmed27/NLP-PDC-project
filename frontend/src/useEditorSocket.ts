@@ -31,10 +31,12 @@ type UseEditorSocketOptions = {
 type ConnectionStatus = 'connecting' | 'open' | 'closed'
 
 const getWebSocketUrl = () => {
-  const configuredUrl = import.meta.env.VITE_EDITOR_WS_URL
+  const configuredUrl = import.meta.env.VITE_EDITOR_WS_URL?.trim()
 
   if (configuredUrl) {
     return configuredUrl
+      .replace(/^https:\/\//, 'wss://')
+      .replace(/^http:\/\//, 'ws://')
   }
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -82,10 +84,12 @@ export function useEditorSocket({
       clearReconnectTimer()
       setStatus('connecting')
 
+      console.info('connecting editor socket', url)
       const socket = new WebSocket(url)
       socketRef.current = socket
 
       socket.addEventListener('open', () => {
+        console.info('editor socket open', url)
         reconnectDelayRef.current = RECONNECT_DELAY_MS
         setStatus('open')
       })
@@ -100,6 +104,7 @@ export function useEditorSocket({
       })
 
       socket.addEventListener('close', () => {
+        console.info('editor socket closed', url)
         if (socketRef.current === socket) {
           socketRef.current = null
         }
@@ -116,6 +121,7 @@ export function useEditorSocket({
       })
 
       socket.addEventListener('error', () => {
+        console.error('editor socket error', url)
         socket.close()
       })
     }
@@ -145,6 +151,7 @@ export function useEditorSocket({
     }
 
     socket.send(JSON.stringify(payload))
+    console.info('editor socket sent', payload)
     return true
   }, [])
 

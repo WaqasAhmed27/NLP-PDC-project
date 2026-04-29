@@ -147,6 +147,7 @@ class GenerationTaskManager:
     ) -> None:
         started_at = time.perf_counter()
         cancelled = False
+        failed = False
 
         try:
             max_new_tokens = 50 if payload.action == "autocomplete" else 80
@@ -174,6 +175,15 @@ class GenerationTaskManager:
         except asyncio.CancelledError:
             cancelled = True
             raise
+        except Exception as exc:
+            failed = True
+            await self.safe_send_stream_payload(
+                request_id=payload.request_id,
+                payload_type="server_error",
+                chunk=f"generation_error: {type(exc).__name__}: {exc}",
+                started_at=started_at,
+            )
+            return
         finally:
             if cancelled:
                 await self.safe_send_stream_payload(
@@ -182,7 +192,7 @@ class GenerationTaskManager:
                     chunk="",
                     started_at=started_at,
                 )
-            elif not cancel_event.is_set():
+            elif not failed and not cancel_event.is_set():
                 await self.safe_send_stream_payload(
                     request_id=payload.request_id,
                     payload_type="done",
