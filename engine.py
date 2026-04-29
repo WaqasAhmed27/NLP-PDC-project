@@ -18,10 +18,34 @@ from typing import Any, Iterator, Optional
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_MAX_SEQ_LEN = 8192
 DEFAULT_MAX_NEW_TOKENS = 50
+DEFAULT_TEMPERATURE = 0.75
+DEFAULT_TOP_P = 0.92
+DEFAULT_TOP_K = 40
+DEFAULT_REPETITION_PENALTY = 1.12
 
 
 def _env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in TRUTHY_ENV_VALUES
+
+
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
 
 
 class MockExLlamaEngine:
@@ -91,6 +115,13 @@ class RealExLlamaEngine:
         self.current_seq_len = 0
         self._last_token_id: Optional[int] = None
         self._next_logits: Optional[Any] = None
+        self.temperature = max(0.0, _env_float("GENERATION_TEMPERATURE", DEFAULT_TEMPERATURE))
+        self.top_p = min(1.0, max(0.0, _env_float("GENERATION_TOP_P", DEFAULT_TOP_P)))
+        self.top_k = max(0, _env_int("GENERATION_TOP_K", DEFAULT_TOP_K))
+        self.repetition_penalty = max(
+            1.0,
+            _env_float("GENERATION_REPETITION_PENALTY", DEFAULT_REPETITION_PENALTY),
+        )
 
         if not Path(self.model_dir).exists():
             raise FileNotFoundError(
@@ -189,7 +220,6 @@ class RealExLlamaEngine:
         max_new_tokens: Optional[int] = None,
     ) -> Iterator[str]:
         limit = max_new_tokens or self.default_max_new_tokens
-        buffered_token_ids: list[int] = []
         generated_token_ids: list[int] = []
         emitted_text = ""
 
@@ -212,7 +242,7 @@ class RealExLlamaEngine:
                     if self.cache.current_seq_len >= self.max_seq_len:
                         break
                     logits = self.model.forward(input_token, self.cache)
-                next_token_id = self._sample_greedy(logits)
+                next_token_id = self._sample_next_token(logits, generated_token_ids)
                 self.current_seq_len = self.cache.current_seq_len
                 self._last_token_id = next_token_id
 
@@ -222,14 +252,12 @@ class RealExLlamaEngine:
                 break
 
             generated_token_ids.append(next_token_id)
-            buffered_token_ids.append(next_token_id)
             chunk = self._decode_complete_chunk(
-                buffered_token_ids,
+                generated_token_ids,
                 emitted_text,
             )
             if chunk:
                 emitted_text += chunk
-                buffered_token_ids.clear()
                 yield chunk
 
             input_token = self.torch.tensor(
@@ -237,17 +265,52 @@ class RealExLlamaEngine:
                 dtype=self.torch.long,
             )
 
-        if not cancel_event.is_set() and buffered_token_ids:
-            chunk = self._decode_complete_chunk(
-                buffered_token_ids,
-                emitted_text,
-            )
-            if chunk:
-                yield chunk
+    def _sample_next_token(self, logits: Any, generated_token_ids: list[int]) -> int:
+        scores = logits[:, -1, :].float().squeeze(0)
 
-    def _sample_greedy(self, logits: Any) -> int:
-        token = self.torch.argmax(logits[:, -1, :], dim=-1)
+        if self.repetition_penalty > 1.0 and generated_token_ids:
+            for token_id in set(generated_token_ids[-128:]):
+                if scores[token_id] < 0:
+                    scores[token_id] *= self.repetition_penalty
+                else:
+                    scores[token_id] /= self.repetition_penalty
+
+        if self.temperature <= 0:
+            return int(self.torch.argmax(scores).item())
+
+        scores = scores / self.temperature
+        scores = self._apply_top_k(scores)
+        scores = self._apply_top_p(scores)
+        probabilities = self.torch.softmax(scores, dim=-1)
+
+        if not self.torch.isfinite(probabilities).all() or probabilities.sum() <= 0:
+            return int(self.torch.argmax(scores).item())
+
+        token = self.torch.multinomial(probabilities, num_samples=1)
         return int(token.item())
+
+    def _apply_top_k(self, scores: Any) -> Any:
+        if self.top_k <= 0 or self.top_k >= scores.shape[-1]:
+            return scores
+
+        values, indexes = self.torch.topk(scores, self.top_k)
+        filtered = self.torch.full_like(scores, float("-inf"))
+        return filtered.scatter(0, indexes, values)
+
+    def _apply_top_p(self, scores: Any) -> Any:
+        if self.top_p <= 0 or self.top_p >= 1:
+            return scores
+
+        sorted_scores, sorted_indexes = self.torch.sort(scores, descending=True)
+        sorted_probabilities = self.torch.softmax(sorted_scores, dim=-1)
+        cumulative_probabilities = self.torch.cumsum(sorted_probabilities, dim=-1)
+        remove_mask = cumulative_probabilities > self.top_p
+        remove_mask[1:] = remove_mask[:-1].clone()
+        remove_mask[0] = False
+        sorted_scores = sorted_scores.masked_fill(remove_mask, float("-inf"))
+
+        filtered = self.torch.full_like(scores, float("-inf"))
+        return filtered.scatter(0, sorted_indexes, sorted_scores)
 
     def _is_eos(self, token_id: int) -> bool:
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
@@ -293,9 +356,19 @@ class RealExLlamaEngine:
             return ""
         if "\ufffd" in text:
             return ""
-        if emitted_text and text.startswith(emitted_text):
-            return text[len(emitted_text):]
-        return text
+        if not emitted_text:
+            return text
+
+        shared_length = 0
+        for previous_char, next_char in zip(emitted_text, text):
+            if previous_char != next_char:
+                break
+            shared_length += 1
+
+        if shared_length < len(emitted_text):
+            return ""
+
+        return text[shared_length:]
 
 
 def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:

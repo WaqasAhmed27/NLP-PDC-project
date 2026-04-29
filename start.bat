@@ -27,6 +27,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Unset any previously set environment variables
+set EXLLAMA_MODEL_DIR=
+set USE_MOCK_ENGINE=
+
 echo [1/2] Starting FastAPI backend on http://127.0.0.1:8000
 echo       (Backend will be running in this terminal)
 echo.
@@ -50,4 +54,5 @@ if errorlevel 1 (
     echo.
     echo Backend exited with an error
     pause
+    exit /b 1
 )

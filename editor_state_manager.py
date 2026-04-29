@@ -29,6 +29,7 @@ Performance notes
 from __future__ import annotations
 
 import bisect
+import os
 from typing import List, Optional, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -47,6 +48,15 @@ SAFETY_MARGIN: int = 4
 
 # Default model whose tokenizer we load.
 DEFAULT_MODEL_ID: str = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+def _default_tokenizer_model_id() -> str:
+    return (
+        os.getenv("EDITOR_TOKENIZER_MODEL")
+        or os.getenv("EXLLAMA_TOKENIZER_MODEL")
+        or os.getenv("EXLLAMA_MODEL_DIR")
+        or DEFAULT_MODEL_ID
+    )
 
 
 # -------------------------------------------------------------------- #
@@ -93,15 +103,17 @@ class EditorStateManager:
     def __init__(
         self,
         engine: MockExLlamaV2Engine,
-        model_id: str = DEFAULT_MODEL_ID,
+        model_id: Optional[str] = None,
         safety_margin: int = SAFETY_MARGIN,
     ) -> None:
         self.engine: MockExLlamaV2Engine = engine
         self.safety_margin: int = safety_margin
 
         # Load the fast tokenizer once.
+        tokenizer_model_id = model_id or _default_tokenizer_model_id()
         self.tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
-            model_id, use_fast=True
+            tokenizer_model_id,
+            use_fast=True,
         )
 
         # Internal state — starts empty.
