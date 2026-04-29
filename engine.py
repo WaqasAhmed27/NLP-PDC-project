@@ -90,6 +90,7 @@ class RealExLlamaEngine:
         self.default_max_new_tokens = max_new_tokens
         self.current_seq_len = 0
         self._last_token_id: Optional[int] = None
+        self._next_logits: Optional[Any] = None
 
         if not Path(self.model_dir).exists():
             raise FileNotFoundError(
@@ -153,6 +154,7 @@ class RealExLlamaEngine:
             self.cache.current_seq_len = 0
             self.current_seq_len = 0
             self._last_token_id = None
+            self._next_logits = None
 
     def truncate(self, safe_token_index: int) -> None:
         with self.gpu_lock:
@@ -169,6 +171,7 @@ class RealExLlamaEngine:
             self.current_seq_len = safe_token_index
             if safe_token_index == 0:
                 self._last_token_id = None
+            self._next_logits = None
 
     def forward_prefill(self, token_ids: list[int]) -> None:
         if not token_ids:
@@ -176,7 +179,7 @@ class RealExLlamaEngine:
 
         with self.gpu_lock, self.torch.inference_mode():
             input_ids = self.torch.tensor([token_ids], dtype=self.torch.long)
-            self.model.forward(input_ids, self.cache)
+            self._next_logits = self.model.forward(input_ids, self.cache)
             self.current_seq_len = self.cache.current_seq_len
             self._last_token_id = int(token_ids[-1])
 
@@ -187,31 +190,38 @@ class RealExLlamaEngine:
     ) -> Iterator[str]:
         limit = max_new_tokens or self.default_max_new_tokens
         buffered_token_ids: list[int] = []
+        generated_token_ids: list[int] = []
         emitted_text = ""
 
         if self._last_token_id is None:
             return
 
-        input_token = self.torch.tensor(
-            [[self._last_token_id]],
-            dtype=self.torch.long,
-        )
+        input_token: Optional[Any] = None
 
         for _ in range(limit):
             if cancel_event.is_set():
                 break
 
             with self.gpu_lock, self.torch.inference_mode():
-                if self.cache.current_seq_len >= self.max_seq_len:
-                    break
-                logits = self.model.forward(input_token, self.cache)
+                if self._next_logits is not None:
+                    logits = self._next_logits
+                    self._next_logits = None
+                else:
+                    if input_token is None:
+                        break
+                    if self.cache.current_seq_len >= self.max_seq_len:
+                        break
+                    logits = self.model.forward(input_token, self.cache)
                 next_token_id = self._sample_greedy(logits)
                 self.current_seq_len = self.cache.current_seq_len
                 self._last_token_id = next_token_id
 
             if self._is_eos(next_token_id):
                 break
+            if self._is_degenerate_repeat(generated_token_ids, next_token_id):
+                break
 
+            generated_token_ids.append(next_token_id)
             buffered_token_ids.append(next_token_id)
             chunk = self._decode_complete_chunk(
                 buffered_token_ids,
@@ -246,6 +256,15 @@ class RealExLlamaEngine:
         if isinstance(eos_token_id, (list, tuple, set)):
             return token_id in eos_token_id
         return token_id == eos_token_id
+
+    def _is_degenerate_repeat(
+        self,
+        generated_token_ids: list[int],
+        next_token_id: int,
+    ) -> bool:
+        if len(generated_token_ids) < 3:
+            return False
+        return all(token_id == next_token_id for token_id in generated_token_ids[-3:])
 
     def _coerce_decoded_text(self, decoded: Any) -> str:
         if isinstance(decoded, str):
