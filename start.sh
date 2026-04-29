@@ -4,6 +4,28 @@
 
 set -e
 
+# Cleanup function for graceful shutdown
+cleanup() {
+    echo ""
+    echo "Shutting down..."
+    
+    # Kill frontend process group
+    if [ ! -z "$FRONTEND_PID" ]; then
+        kill -TERM $FRONTEND_PID 2>/dev/null || true
+        wait $FRONTEND_PID 2>/dev/null || true
+    fi
+    
+    # Kill any remaining npm/vite processes
+    pkill -f "npm run dev" 2>/dev/null || true
+    pkill -f "vite" 2>/dev/null || true
+    
+    echo "✓ Cleanup complete"
+    exit 0
+}
+
+# Register cleanup on Ctrl+C and other signals
+trap cleanup SIGINT SIGTERM EXIT
+
 echo ""
 echo "============================================"
 echo "Starting Editor Backend and Frontend"
@@ -16,6 +38,14 @@ if [ ! -f .env ]; then
     echo "Please run ./setup.sh first"
     exit 1
 fi
+
+# Unset any previously set environment variables
+unset EXLLAMA_MODEL_DIR
+unset USE_MOCK_ENGINE
+
+# Set CUDA_HOME for ExLlamaV2
+export CUDA_HOME=/usr/local/cuda-12.4
+export PATH=/usr/local/cuda-12.4/bin:$PATH
 
 # Activate virtual environment
 source venv/bin/activate
@@ -39,5 +69,5 @@ sleep 2
 # Start backend (foreground)
 python server.py
 
-# Cleanup frontend on exit
-kill $FRONTEND_PID 2>/dev/null || true
+# Cleanup on normal exit
+cleanup

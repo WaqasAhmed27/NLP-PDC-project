@@ -30,7 +30,12 @@ type UseEditorSocketOptions = {
 
 type ConnectionStatus = 'connecting' | 'open' | 'closed'
 
-const DEFAULT_EDITOR_SOCKET_URL = 'ws://localhost:8000/ws/editor'
+const getWebSocketUrl = () => {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}/ws/editor`
+}
+
+const DEFAULT_EDITOR_SOCKET_URL = getWebSocketUrl()
 const RECONNECT_DELAY_MS = 500
 const MAX_RECONNECT_DELAY_MS = 5000
 

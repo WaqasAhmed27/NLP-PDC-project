@@ -251,12 +251,3 @@ async def editor_websocket(websocket: WebSocket) -> None:
                 break
     except WebSocketDisconnect:
         await generation_manager.cancel_active_generation()
-
-
-if __name__ == '__main__':
-    import uvicorn
-    import os
-    host = os.getenv('SERVER_HOST', '127.0.0.1')
-    port = int(os.getenv('SERVER_PORT', 8000))
-    uvicorn.run(app, host=host, port=port)
-
