@@ -118,19 +118,29 @@ class RealExLlamaEngine:
             self.config.arch_compat_overrides()
 
         self.model = ExLlamaV2(self.config)
-        try:
-            self.cache = ExLlamaV2Cache_8bit(
-                self.model,
-                batch_size=1,
-                max_seq_len=max_seq_len,
-            )
-        except TypeError:
-            self.cache = ExLlamaV2Cache_8bit(
-                self.model,
-                max_seq_len=max_seq_len,
-            )
-        self.model.load()
+        self.cache = self._build_cache(ExLlamaV2Cache_8bit, max_seq_len)
+        if hasattr(self.model, "load_autosplit"):
+            self.model.load_autosplit(self.cache)
+        else:
+            self.model.load()
         self.tokenizer = self._build_tokenizer(ExLlamaV2Tokenizer)
+
+    def _build_cache(self, cache_cls: Any, max_seq_len: int) -> Any:
+        candidates = (
+            {"batch_size": 1, "max_seq_len": max_seq_len, "lazy": True},
+            {"max_seq_len": max_seq_len, "lazy": True},
+            {"batch_size": 1, "max_seq_len": max_seq_len},
+            {"max_seq_len": max_seq_len},
+        )
+        last_error: Optional[TypeError] = None
+
+        for kwargs in candidates:
+            try:
+                return cache_cls(self.model, **kwargs)
+            except TypeError as exc:
+                last_error = exc
+
+        raise RuntimeError("Could not initialize ExLlamaV2 cache") from last_error
 
     def _build_tokenizer(self, tokenizer_cls: Any) -> Any:
         try:

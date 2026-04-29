@@ -105,10 +105,20 @@ class GenerationTaskManager:
 
     async def apply_edit(self, payload: EditorPayload) -> Any:
         async with self.state_lock:
+            edit_char_index = payload.edit_char_index
+            if edit_char_index > len(self.manager.current_text):
+                print(
+                    "Clamping stale edit_char_index "
+                    f"{edit_char_index} to 0 for current_text_len="
+                    f"{len(self.manager.current_text)}",
+                    flush=True,
+                )
+                edit_char_index = 0
+
             return await asyncio.to_thread(
                 self.manager.apply_edit,
                 payload.new_text,
-                payload.edit_char_index,
+                edit_char_index,
             )
 
     async def cancel_active_generation(self) -> None:
