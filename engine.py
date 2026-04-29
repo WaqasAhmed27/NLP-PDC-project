@@ -149,6 +149,10 @@ class RealExLlamaEngine:
                 ExLlamaV2Config,
                 ExLlamaV2Tokenizer,
             )
+            from exllamav2.generator import (
+                ExLlamaV2Sampler,
+                ExLlamaV2StreamingGenerator,
+            )
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "RealExLlamaEngine requires exllamav2 and torch. Set "
@@ -156,6 +160,7 @@ class RealExLlamaEngine:
             ) from exc
 
         self.torch = torch
+        self.sampler_cls = ExLlamaV2Sampler
         self.config = ExLlamaV2Config(self.model_dir)
         if hasattr(self.config, "prepare"):
             self.config.prepare()
@@ -169,6 +174,12 @@ class RealExLlamaEngine:
         else:
             self.model.load()
         self.tokenizer = self._build_tokenizer(ExLlamaV2Tokenizer)
+        self.generator = ExLlamaV2StreamingGenerator(
+            self.model,
+            self.cache,
+            self.tokenizer,
+        )
+        self.sampling_settings = self._build_sampling_settings()
 
     def _build_cache(self, cache_cls: Any, max_seq_len: int) -> Any:
         candidates = (
@@ -192,6 +203,24 @@ class RealExLlamaEngine:
             return tokenizer_cls(self.config)
         except TypeError:
             return tokenizer_cls(self.model_dir)
+
+    def _build_sampling_settings(self) -> Any:
+        settings = self.sampler_cls.Settings()
+        settings.temperature = self.temperature
+        settings.top_p = self.top_p
+        settings.top_k = self.top_k
+        settings.token_repetition_penalty = self.repetition_penalty
+        if hasattr(settings, "token_repetition_range"):
+            settings.token_repetition_range = -1
+        if hasattr(settings, "dry_multiplier"):
+            settings.dry_multiplier = _env_float("GENERATION_DRY_MULTIPLIER", 0.35)
+        if hasattr(settings, "dry_allowed_length"):
+            settings.dry_allowed_length = _env_int("GENERATION_DRY_ALLOWED_LENGTH", 2)
+        if hasattr(settings, "dry_base"):
+            settings.dry_base = _env_float("GENERATION_DRY_BASE", 1.75)
+        if hasattr(settings, "dry_range"):
+            settings.dry_range = _env_int("GENERATION_DRY_RANGE", 512)
+        return settings
 
     def reset(self) -> None:
         with self.gpu_lock:
@@ -241,24 +270,32 @@ class RealExLlamaEngine:
         if not prompt_token_ids:
             return
 
-        self.reset()
-        self.forward_prefill(prompt_token_ids)
-        self.requires_full_prefill = True
+        input_ids = self.torch.tensor([prompt_token_ids], dtype=self.torch.long)
 
-        emitted_text = ""
-        for chunk in self.generate_stream(cancel_event, max_new_tokens):
+        with self.gpu_lock, self.torch.inference_mode():
+            self.generator.set_stop_conditions(self._autocomplete_stop_conditions())
+            self.generator.begin_stream_ex(
+                input_ids,
+                self.sampling_settings,
+                token_healing=True,
+            )
+            self.current_seq_len = self.cache.current_seq_len
+            self._last_token_id = int(prompt_token_ids[-1])
+            self._next_logits = None
+            self.requires_full_prefill = True
+
+        for _ in range(max_new_tokens):
             if cancel_event.is_set():
                 break
 
-            trimmed_text, should_stop = self._trim_autocomplete_output(
-                emitted_text + chunk,
-            )
-            delta = trimmed_text[len(emitted_text):]
-            if delta:
-                emitted_text = trimmed_text
-                yield delta
+            with self.gpu_lock, self.torch.inference_mode():
+                result = self.generator.stream_ex()
+                self.current_seq_len = self.cache.current_seq_len
 
-            if should_stop:
+            chunk = result.get("chunk", "")
+            if chunk:
+                yield chunk
+            if result.get("eos", False):
                 break
 
     def generate_stream(
@@ -335,16 +372,31 @@ class RealExLlamaEngine:
         )
 
     def _encode_prompt(self, prompt: str) -> list[int]:
-        encoded = self.tokenizer.encode(prompt)
+        encode_attempts = (
+            {"add_bos": False, "add_eos": False, "encode_special_tokens": True},
+            {"add_bos": False, "add_eos": False},
+            {},
+        )
+
+        encoded: Any = None
+        for kwargs in encode_attempts:
+            try:
+                encoded = self.tokenizer.encode(prompt, **kwargs)
+                break
+            except TypeError:
+                continue
+
+        if encoded is None:
+            encoded = self.tokenizer.encode(prompt)
+
         if hasattr(encoded, "tolist"):
             encoded = encoded.tolist()
         if encoded and isinstance(encoded[0], list):
             encoded = encoded[0]
         return [int(token_id) for token_id in encoded]
 
-    def _trim_autocomplete_output(self, text: str) -> tuple[str, bool]:
-        stop_strings = (
-            "\n",
+    def _autocomplete_stop_conditions(self) -> list[Any]:
+        stop_conditions: list[Any] = [
             "<|im_end|>",
             "<|endoftext|>",
             "</s>",
@@ -356,18 +408,11 @@ class RealExLlamaEngine:
             "human:",
             "Dear user",
             "Dear User",
-        )
-
-        stop_index: Optional[int] = None
-        for stop_string in stop_strings:
-            index = text.find(stop_string)
-            if index != -1 and (stop_index is None or index < stop_index):
-                stop_index = index
-
-        if stop_index is None:
-            return text, False
-
-        return text[:stop_index].rstrip(), True
+        ]
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            stop_conditions.append(eos_token_id)
+        return stop_conditions
 
     def _sample_next_token(self, logits: Any, generated_token_ids: list[int]) -> int:
         scores = logits[:, -1, :].float().squeeze(0)
