@@ -251,9 +251,9 @@ class RealExLlamaEngine:
         for candidate in (token_ids, self.torch.tensor([token_ids])):
             try:
                 return self.tokenizer.decode(candidate)
-            except TypeError:
+            except (AssertionError, TypeError):
                 continue
-        return self.tokenizer.decode(token_ids)
+        return self.tokenizer.decode(self.torch.tensor([token_ids]))
 
     def _decode_complete_chunk(
         self,
