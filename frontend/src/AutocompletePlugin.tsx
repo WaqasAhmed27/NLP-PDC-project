@@ -164,13 +164,7 @@ export function AutocompletePlugin({
   }, [editor, onUserDismiss])
 
   useEffect(() => {
-    const rootElement = editor.getRootElement()
-
-    if (!rootElement) {
-      return
-    }
-
-    const handleKeyDown = (event: KeyboardEvent) => {
+    const acceptTab = (event: KeyboardEvent) => {
       if (event.key !== 'Tab') {
         return
       }
@@ -184,8 +178,31 @@ export function AutocompletePlugin({
       if (accepted) {
         event.preventDefault()
         event.stopPropagation()
+        event.stopImmediatePropagation()
         onUserDismiss?.()
       }
+    }
+    const unregisterRootListener = editor.registerRootListener(
+      (rootElement, previousRootElement) => {
+        previousRootElement?.removeEventListener('keydown', acceptTab, true)
+        rootElement?.addEventListener('keydown', acceptTab, true)
+      },
+    )
+
+    document.addEventListener('keydown', acceptTab, true)
+
+    return () => {
+      unregisterRootListener()
+      editor.getRootElement()?.removeEventListener('keydown', acceptTab, true)
+      document.removeEventListener('keydown', acceptTab, true)
+    }
+  }, [editor, onUserDismiss])
+
+  useEffect(() => {
+    const rootElement = editor.getRootElement()
+
+    if (!rootElement) {
+      return
     }
 
     const handlePointerDown = () => {
@@ -196,11 +213,9 @@ export function AutocompletePlugin({
       })
     }
 
-    rootElement.addEventListener('keydown', handleKeyDown, true)
     rootElement.addEventListener('pointerdown', handlePointerDown, true)
 
     return () => {
-      rootElement.removeEventListener('keydown', handleKeyDown, true)
       rootElement.removeEventListener('pointerdown', handlePointerDown, true)
     }
   }, [editor, onUserDismiss])

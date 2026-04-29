@@ -31,6 +31,12 @@ type UseEditorSocketOptions = {
 type ConnectionStatus = 'connecting' | 'open' | 'closed'
 
 const getWebSocketUrl = () => {
+  const configuredUrl = import.meta.env.VITE_EDITOR_WS_URL
+
+  if (configuredUrl) {
+    return configuredUrl
+  }
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${protocol}//${window.location.host}/ws/editor`
 }
