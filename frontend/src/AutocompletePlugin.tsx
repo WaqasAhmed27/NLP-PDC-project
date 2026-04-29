@@ -170,6 +170,24 @@ export function AutocompletePlugin({
       return
     }
 
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') {
+        return
+      }
+
+      let accepted = false
+
+      editor.update(() => {
+        accepted = $acceptAutocompleteNode()
+      })
+
+      if (accepted) {
+        event.preventDefault()
+        event.stopPropagation()
+        onUserDismiss?.()
+      }
+    }
+
     const handlePointerDown = () => {
       editor.update(() => {
         if ($removeAutocompleteNode()) {
@@ -178,9 +196,11 @@ export function AutocompletePlugin({
       })
     }
 
+    rootElement.addEventListener('keydown', handleKeyDown, true)
     rootElement.addEventListener('pointerdown', handlePointerDown, true)
 
     return () => {
+      rootElement.removeEventListener('keydown', handleKeyDown, true)
       rootElement.removeEventListener('pointerdown', handlePointerDown, true)
     }
   }, [editor, onUserDismiss])

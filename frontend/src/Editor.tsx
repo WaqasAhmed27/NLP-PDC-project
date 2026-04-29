@@ -224,11 +224,12 @@ export function Editor() {
     const editCharIndex = textChanged
       ? getFirstChangedCharacterIndex(lastSentText, pendingEdit.text)
       : pendingEdit.cursorCharIndex
+    const safeEditCharIndex = Math.min(editCharIndex, lastSentText.length)
 
     const sent = sendMessage({
       action: 'edit',
       newText: pendingEdit.text,
-      editCharIndex,
+      editCharIndex: safeEditCharIndex,
     })
 
     if (sent) {
@@ -236,7 +237,7 @@ export function Editor() {
       lastSentCursorRef.current = pendingEdit.cursorCharIndex
       console.info('sent editor edit', {
         new_text: pendingEdit.text,
-        edit_char_index: editCharIndex,
+        edit_char_index: safeEditCharIndex,
         cursor_char_index: pendingEdit.cursorCharIndex,
       })
       scheduleAutocomplete(pendingEdit.text, pendingEdit.cursorCharIndex)
