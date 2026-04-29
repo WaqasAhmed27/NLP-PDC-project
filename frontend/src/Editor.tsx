@@ -7,6 +7,8 @@ import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin'
 import { OnChangePlugin } from '@lexical/react/LexicalOnChangePlugin'
 import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary'
 import { useEditorSocket, type IncomingEditorMessage } from './useEditorSocket'
+import { AutocompleteNode, $isAutocompleteNode } from './AutocompleteNode'
+import { AutocompletePlugin, type TokenChunkEvent } from './AutocompletePlugin'
 
 type PendingEdit = {
   text: string
@@ -14,13 +16,31 @@ type PendingEdit = {
 }
 
 const EDIT_DEBOUNCE_MS = 50
+const AUTOCOMPLETE_DEBOUNCE_MS = 250
 
 const lexicalTheme = {
   paragraph: 'editor-paragraph',
 }
 
 function getNodeTextLength(node: LexicalNode) {
-  return node.getTextContent().length
+  return getGhostFreeTextContent(node).length
+}
+
+function getGhostFreeTextContent(node: LexicalNode): string {
+  if ($isAutocompleteNode(node)) {
+    return ''
+  }
+
+  if (!$isElementNode(node)) {
+    return node.getTextContent()
+  }
+
+  const children = node.getChildren()
+  const isRoot = node.getParent() === null
+
+  return children
+    .map((child) => getGhostFreeTextContent(child))
+    .join(isRoot ? '\n' : '')
 }
 
 function getElementTextOffset(element: ElementNode, childOffset: number) {
@@ -84,7 +104,7 @@ function getAbsoluteOffsetInPlainText(
 function getCursorCharacterIndex() {
   const root = $getRoot()
   const selection = $getSelection()
-  const text = root.getTextContent()
+  const text = getGhostFreeTextContent(root)
 
   if (!$isRangeSelection(selection)) {
     return text.length
@@ -116,12 +136,26 @@ function getFirstChangedCharacterIndex(previousText: string, nextText: string) {
 
 export function Editor() {
   const debounceTimerRef = useRef<number | null>(null)
+  const autocompleteTimerRef = useRef<number | null>(null)
   const pendingEditRef = useRef<PendingEdit | null>(null)
   const lastSentTextRef = useRef('')
+  const lastSentCursorRef = useRef(0)
+  const suppressIncomingTokensRef = useRef(false)
+  const tokenChunkIdRef = useRef(0)
   const [lastMessage, setLastMessage] = useState<IncomingEditorMessage | null>(null)
+  const [tokenChunk, setTokenChunk] = useState<TokenChunkEvent | null>(null)
 
   const handleSocketMessage = useCallback((payload: IncomingEditorMessage) => {
     setLastMessage(payload)
+
+    if (payload.type === 'token' && payload.chunk && !suppressIncomingTokensRef.current) {
+      tokenChunkIdRef.current += 1
+      setTokenChunk({
+        id: tokenChunkIdRef.current,
+        chunk: payload.chunk,
+      })
+    }
+
     console.info('editor socket message', payload)
   }, [])
 
@@ -134,7 +168,39 @@ export function Editor() {
       if (debounceTimerRef.current !== null) {
         window.clearTimeout(debounceTimerRef.current)
       }
+
+      if (autocompleteTimerRef.current !== null) {
+        window.clearTimeout(autocompleteTimerRef.current)
+      }
     }
+  }, [])
+
+  const scheduleAutocomplete = useCallback(
+    (text: string, cursorCharIndex: number) => {
+      if (autocompleteTimerRef.current !== null) {
+        window.clearTimeout(autocompleteTimerRef.current)
+      }
+
+      if (!text.trim()) {
+        return
+      }
+
+      autocompleteTimerRef.current = window.setTimeout(() => {
+        autocompleteTimerRef.current = null
+        sendMessage({
+          action: 'autocomplete',
+          newText: text,
+          editCharIndex: cursorCharIndex,
+        })
+        suppressIncomingTokensRef.current = false
+      }, AUTOCOMPLETE_DEBOUNCE_MS)
+    },
+    [sendMessage],
+  )
+
+  const handleGhostDismiss = useCallback(() => {
+    suppressIncomingTokensRef.current = true
+    setTokenChunk(null)
   }, [])
 
   const flushPendingEdit = useCallback(() => {
@@ -146,14 +212,18 @@ export function Editor() {
     }
 
     const lastSentText = lastSentTextRef.current
-    if (lastSentText === pendingEdit.text) {
+    const lastSentCursor = lastSentCursorRef.current
+    if (
+      lastSentText === pendingEdit.text &&
+      lastSentCursor === pendingEdit.cursorCharIndex
+    ) {
       return
     }
 
-    const editCharIndex = getFirstChangedCharacterIndex(
-      lastSentText,
-      pendingEdit.text,
-    )
+    const textChanged = lastSentText !== pendingEdit.text
+    const editCharIndex = textChanged
+      ? getFirstChangedCharacterIndex(lastSentText, pendingEdit.text)
+      : pendingEdit.cursorCharIndex
 
     const sent = sendMessage({
       action: 'edit',
@@ -163,13 +233,15 @@ export function Editor() {
 
     if (sent) {
       lastSentTextRef.current = pendingEdit.text
+      lastSentCursorRef.current = pendingEdit.cursorCharIndex
       console.info('sent editor edit', {
         new_text: pendingEdit.text,
         edit_char_index: editCharIndex,
         cursor_char_index: pendingEdit.cursorCharIndex,
       })
+      scheduleAutocomplete(pendingEdit.text, pendingEdit.cursorCharIndex)
     }
-  }, [sendMessage])
+  }, [scheduleAutocomplete, sendMessage])
 
   const scheduleEdit = useCallback(
     (edit: PendingEdit) => {
@@ -177,6 +249,10 @@ export function Editor() {
 
       if (debounceTimerRef.current !== null) {
         window.clearTimeout(debounceTimerRef.current)
+      }
+
+      if (autocompleteTimerRef.current !== null) {
+        window.clearTimeout(autocompleteTimerRef.current)
       }
 
       debounceTimerRef.current = window.setTimeout(() => {
@@ -190,6 +266,7 @@ export function Editor() {
   const initialConfig = {
     namespace: 'Phase5Editor',
     theme: lexicalTheme,
+    nodes: [AutocompleteNode],
     onError(error: Error) {
       throw error
     },
@@ -221,10 +298,15 @@ export function Editor() {
             ErrorBoundary={LexicalErrorBoundary}
           />
           <HistoryPlugin />
+          <AutocompletePlugin
+            onUserDismiss={handleGhostDismiss}
+            tokenChunk={tokenChunk}
+          />
           <OnChangePlugin
+            ignoreSelectionChange={false}
             onChange={(editorState) => {
               editorState.read(() => {
-                const text = $getRoot().getTextContent()
+                const text = getGhostFreeTextContent($getRoot())
                 const cursorCharIndex = getCursorCharacterIndex()
                 scheduleEdit({ text, cursorCharIndex })
               })
