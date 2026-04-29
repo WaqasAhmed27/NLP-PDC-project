@@ -8,6 +8,139 @@ This project implements a surgical cache rewind-and-retokenize algorithm that al
 
 **Key Achievement:** 44/44 comprehensive test suite with semantic offset validation, BPE boundary merge protection, and cache desync assertions—all mathematically proven and production-ready.
 
+## Getting Started
+
+### Prerequisites
+- **Python 3.10+** — Download from [python.org](https://www.python.org)
+- **Node.js 16+** — Download from [nodejs.org](https://nodejs.org)
+- **GPU (optional)** — For production use with ExLlamaV2 (NVIDIA CUDA required). For development, the mock engine runs on CPU.
+
+### Quick Setup (First Time Only)
+
+**Windows:**
+```cmd
+setup.bat
+```
+
+**Linux/Mac:**
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+This will:
+1. Create a Python virtual environment
+2. Install Python dependencies
+3. Create `.env` configuration file
+4. Install frontend dependencies
+
+### Configuration
+
+Edit `.env` to configure the project:
+
+```env
+# Use mock engine for local CPU testing (true) or real ExLlamaV2 (false)
+USE_MOCK_ENGINE=true
+
+# Path to ExLlamaV2 model directory (only needed if USE_MOCK_ENGINE=false)
+EXLLAMA_MODEL_DIR=
+
+# Backend WebSocket URL
+EDITOR_WS_URL=ws://127.0.0.1:8000/ws/editor
+
+# Server configuration
+SERVER_HOST=127.0.0.1
+SERVER_PORT=8000
+DEBUG=false
+```
+
+### Running the Project
+
+**Windows:**
+```cmd
+start.bat
+```
+
+**Linux/Mac:**
+```bash
+./start.sh
+```
+
+This starts:
+- **Backend:** FastAPI WebSocket server on `http://127.0.0.1:8000`
+- **Frontend:** Vite dev server on `http://127.0.0.1:5173`
+
+### Manual Backend Start (Alternative)
+
+If you prefer to run backend and frontend separately:
+
+```bash
+# Terminal 1 - Backend
+source venv/bin/activate  # Windows: venv\Scripts\activate.bat
+python server.py
+
+# Terminal 2 - Frontend
+cd frontend
+npm run dev
+```
+
+### Testing
+
+Run the comprehensive test suite:
+
+```bash
+source venv/bin/activate  # Windows: venv\Scripts\activate.bat
+pytest test_editor_state_manager.py -v
+```
+
+Run stress tests:
+
+```bash
+source venv/bin/activate  # Windows: venv\Scripts\activate.bat
+python stress_test.py --workers 50 --loops 10
+```
+
+### Deploying to Another Machine
+
+To use this project on another machine:
+
+1. **Clone the repository:**
+   ```bash
+   git clone <repo-url>
+   cd <repo-name>
+   ```
+
+2. **Run setup:**
+   - **Windows:** `setup.bat`
+   - **Linux/Mac:** `./setup.sh`
+
+3. **Update `.env` if needed** for your machine's configuration
+
+4. **Start the project:**
+   - **Windows:** `start.bat`
+   - **Linux/Mac:** `./start.sh`
+
+### Troubleshooting
+
+**Python not found:**
+- Ensure Python 3.10+ is installed and in your PATH
+- Try `python3` instead of `python`
+
+**Node.js not found:**
+- Ensure Node.js 16+ is installed and in your PATH
+
+**Virtual environment activation fails:**
+- Delete `venv/` folder and re-run setup script
+
+**WebSocket connection refused:**
+- Ensure backend is running on the correct host/port
+- Check `.env` configuration
+- Verify firewall isn't blocking the port
+
+**ExLlamaV2 import error:**
+- You're likely using the real engine. Set `USE_MOCK_ENGINE=true` in `.env` for CPU-only testing
+- For GPU support, install ExLlamaV2: `pip install exllamav2`
+
 ## Architecture
 
 ### Core Algorithm: Prefix Truncation & Suffix Re-tokenization
