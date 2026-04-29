@@ -106,6 +106,8 @@ class GenerationTaskManager:
     async def apply_edit(self, payload: EditorPayload) -> Any:
         async with self.state_lock:
             edit_char_index = payload.edit_char_index
+            if getattr(self.manager.engine, "requires_full_prefill", False):
+                edit_char_index = 0
             if edit_char_index > len(self.manager.current_text):
                 print(
                     "Clamping stale edit_char_index "
@@ -150,12 +152,23 @@ class GenerationTaskManager:
         failed = False
 
         try:
-            max_new_tokens = 50 if payload.action == "autocomplete" else 80
-            token_iterator = await asyncio.to_thread(
-                self.manager.engine.generate_stream,
-                cancel_event,
-                max_new_tokens,
-            )
+            max_new_tokens = 24 if payload.action == "autocomplete" else 80
+            if payload.action == "autocomplete" and hasattr(
+                self.manager.engine,
+                "generate_autocomplete_stream",
+            ):
+                token_iterator = await asyncio.to_thread(
+                    self.manager.engine.generate_autocomplete_stream,
+                    self.manager.current_text,
+                    cancel_event,
+                    max_new_tokens,
+                )
+            else:
+                token_iterator = await asyncio.to_thread(
+                    self.manager.engine.generate_stream,
+                    cancel_event,
+                    max_new_tokens,
+                )
             while not cancel_event.is_set():
                 token = await asyncio.to_thread(_next_token, token_iterator)
                 if token is None:

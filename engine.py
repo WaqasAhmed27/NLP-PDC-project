@@ -56,12 +56,14 @@ class MockExLlamaEngine:
         self.current_seq_len = 0
         self.prefill_history: list[list[int]] = []
         self.truncation_history: list[int] = []
+        self.requires_full_prefill = False
 
     def reset(self) -> None:
         with self.gpu_lock:
             self.current_seq_len = 0
             self.prefill_history.clear()
             self.truncation_history.clear()
+            self.requires_full_prefill = False
 
     def truncate(self, safe_token_index: int) -> None:
         with self.gpu_lock:
@@ -76,6 +78,7 @@ class MockExLlamaEngine:
                 )
             self.truncation_history.append(safe_token_index)
             self.current_seq_len = safe_token_index
+            self.requires_full_prefill = False
 
     def forward_prefill(self, token_ids: list[int]) -> None:
         if not token_ids:
@@ -83,6 +86,7 @@ class MockExLlamaEngine:
         with self.gpu_lock:
             self.prefill_history.append(list(token_ids))
             self.current_seq_len += len(token_ids)
+            self.requires_full_prefill = False
 
     def generate_stream(
         self,
@@ -97,6 +101,14 @@ class MockExLlamaEngine:
             if cancel_event.is_set():
                 break
             yield token
+
+    def generate_autocomplete_stream(
+        self,
+        document_text: str,
+        cancel_event: Any,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    ) -> Iterator[str]:
+        yield from self.generate_stream(cancel_event, max_new_tokens)
 
 
 class RealExLlamaEngine:
@@ -115,6 +127,7 @@ class RealExLlamaEngine:
         self.current_seq_len = 0
         self._last_token_id: Optional[int] = None
         self._next_logits: Optional[Any] = None
+        self.requires_full_prefill = False
         self.temperature = max(0.0, _env_float("GENERATION_TEMPERATURE", DEFAULT_TEMPERATURE))
         self.top_p = min(1.0, max(0.0, _env_float("GENERATION_TOP_P", DEFAULT_TOP_P)))
         self.top_k = max(0, _env_int("GENERATION_TOP_K", DEFAULT_TOP_K))
@@ -186,6 +199,7 @@ class RealExLlamaEngine:
             self.current_seq_len = 0
             self._last_token_id = None
             self._next_logits = None
+            self.requires_full_prefill = False
 
     def truncate(self, safe_token_index: int) -> None:
         with self.gpu_lock:
@@ -203,6 +217,7 @@ class RealExLlamaEngine:
             if safe_token_index == 0:
                 self._last_token_id = None
             self._next_logits = None
+            self.requires_full_prefill = False
 
     def forward_prefill(self, token_ids: list[int]) -> None:
         if not token_ids:
@@ -213,6 +228,38 @@ class RealExLlamaEngine:
             self._next_logits = self.model.forward(input_ids, self.cache)
             self.current_seq_len = self.cache.current_seq_len
             self._last_token_id = int(token_ids[-1])
+            self.requires_full_prefill = False
+
+    def generate_autocomplete_stream(
+        self,
+        document_text: str,
+        cancel_event: Any,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    ) -> Iterator[str]:
+        prompt = self._build_autocomplete_prompt(document_text)
+        prompt_token_ids = self._encode_prompt(prompt)
+        if not prompt_token_ids:
+            return
+
+        self.reset()
+        self.forward_prefill(prompt_token_ids)
+        self.requires_full_prefill = True
+
+        emitted_text = ""
+        for chunk in self.generate_stream(cancel_event, max_new_tokens):
+            if cancel_event.is_set():
+                break
+
+            trimmed_text, should_stop = self._trim_autocomplete_output(
+                emitted_text + chunk,
+            )
+            delta = trimmed_text[len(emitted_text):]
+            if delta:
+                emitted_text = trimmed_text
+                yield delta
+
+            if should_stop:
+                break
 
     def generate_stream(
         self,
@@ -264,6 +311,63 @@ class RealExLlamaEngine:
                 [[next_token_id]],
                 dtype=self.torch.long,
             )
+
+    def _build_autocomplete_prompt(self, document_text: str) -> str:
+        mode = os.getenv("AUTOCOMPLETE_PROMPT_MODE", "auto").strip().lower()
+        is_instruct_model = "instruct" in self.model_dir.lower()
+
+        if mode == "raw" or (mode == "auto" and not is_instruct_model):
+            return document_text
+
+        return (
+            "<|im_start|>system\n"
+            "You are inline autocomplete for a plain text editor. Continue "
+            "the user's text with only the next natural words. Do not answer "
+            "the user. Do not add labels, bullets, numbering, markdown, or "
+            "explanations. Keep the continuation short.\n"
+            "<|im_end|>\n"
+            "<|im_start|>user\n"
+            "Continue this text exactly from the cursor. Return only the "
+            "continuation, without repeating the text.\n\n"
+            f"{document_text}\n"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+    def _encode_prompt(self, prompt: str) -> list[int]:
+        encoded = self.tokenizer.encode(prompt)
+        if hasattr(encoded, "tolist"):
+            encoded = encoded.tolist()
+        if encoded and isinstance(encoded[0], list):
+            encoded = encoded[0]
+        return [int(token_id) for token_id in encoded]
+
+    def _trim_autocomplete_output(self, text: str) -> tuple[str, bool]:
+        stop_strings = (
+            "\n",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "</s>",
+            "User:",
+            "user:",
+            "Assistant:",
+            "assistant:",
+            "Human:",
+            "human:",
+            "Dear user",
+            "Dear User",
+        )
+
+        stop_index: Optional[int] = None
+        for stop_string in stop_strings:
+            index = text.find(stop_string)
+            if index != -1 and (stop_index is None or index < stop_index):
+                stop_index = index
+
+        if stop_index is None:
+            return text, False
+
+        return text[:stop_index].rstrip(), True
 
     def _sample_next_token(self, logits: Any, generated_token_ids: list[int]) -> int:
         scores = logits[:, -1, :].float().squeeze(0)
