@@ -247,13 +247,22 @@ class RealExLlamaEngine:
             return token_id in eos_token_id
         return token_id == eos_token_id
 
+    def _coerce_decoded_text(self, decoded: Any) -> str:
+        if isinstance(decoded, str):
+            return decoded
+        if isinstance(decoded, list):
+            return "".join(str(part) for part in decoded)
+        return str(decoded)
+
     def _decode_tokens(self, token_ids: list[int]) -> str:
         for candidate in (token_ids, self.torch.tensor([token_ids])):
             try:
-                return self.tokenizer.decode(candidate)
+                return self._coerce_decoded_text(self.tokenizer.decode(candidate))
             except (AssertionError, TypeError):
                 continue
-        return self.tokenizer.decode(self.torch.tensor([token_ids]))
+        return self._coerce_decoded_text(
+            self.tokenizer.decode(self.torch.tensor([token_ids]))
+        )
 
     def _decode_complete_chunk(
         self,
