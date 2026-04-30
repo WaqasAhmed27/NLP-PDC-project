@@ -176,7 +176,7 @@ export function Editor() {
   }, [])
 
   const scheduleAutocomplete = useCallback(
-    (text: string) => {
+    (text: string, cursorCharIndex: number) => {
       if (autocompleteTimerRef.current !== null) {
         window.clearTimeout(autocompleteTimerRef.current)
       }
@@ -190,7 +190,7 @@ export function Editor() {
         sendMessage({
           action: 'autocomplete',
           newText: text,
-          editCharIndex: 0,
+          editCharIndex: cursorCharIndex,
         })
         suppressIncomingTokensRef.current = false
       }, AUTOCOMPLETE_DEBOUNCE_MS)
@@ -240,7 +240,7 @@ export function Editor() {
         edit_char_index: safeEditCharIndex,
         cursor_char_index: pendingEdit.cursorCharIndex,
       })
-      scheduleAutocomplete(pendingEdit.text)
+      scheduleAutocomplete(pendingEdit.text, pendingEdit.cursorCharIndex)
     }
   }, [scheduleAutocomplete, sendMessage])
 

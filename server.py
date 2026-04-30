@@ -160,6 +160,10 @@ class GenerationTaskManager:
                 token_iterator = await asyncio.to_thread(
                     self.manager.engine.generate_autocomplete_stream,
                     self.manager.current_text,
+                    min(
+                        max(payload.edit_char_index, 0),
+                        len(self.manager.current_text),
+                    ),
                     cancel_event,
                     max_new_tokens,
                 )

@@ -18,10 +18,24 @@ from typing import Any, Iterator, Optional
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_MAX_SEQ_LEN = 8192
 DEFAULT_MAX_NEW_TOKENS = 50
-DEFAULT_TEMPERATURE = 0.75
-DEFAULT_TOP_P = 0.92
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TOP_P = 0.9
 DEFAULT_TOP_K = 40
-DEFAULT_REPETITION_PENALTY = 1.12
+DEFAULT_REPETITION_PENALTY = 1.05
+FIM_PREFIX = "<|fim_prefix|>"
+FIM_SUFFIX = "<|fim_suffix|>"
+FIM_MIDDLE = "<|fim_middle|>"
+FIM_PAD = "<|fim_pad|>"
+QWEN_FIM_STOP_STRINGS = (
+    FIM_PREFIX,
+    FIM_SUFFIX,
+    FIM_MIDDLE,
+    FIM_PAD,
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "</s>",
+)
 
 
 def _env_truthy(name: str) -> bool:
@@ -46,6 +60,17 @@ def _env_int(name: str, default: int) -> int:
         return int(raw_value)
     except ValueError:
         return default
+
+
+def clamp_cursor_index(document_text: str, cursor_char_index: int) -> int:
+    return min(max(cursor_char_index, 0), len(document_text))
+
+
+def build_qwen_fim_prompt(document_text: str, cursor_char_index: int) -> str:
+    cursor_char_index = clamp_cursor_index(document_text, cursor_char_index)
+    prefix = document_text[:cursor_char_index]
+    suffix = document_text[cursor_char_index:]
+    return f"{FIM_PREFIX}{prefix}{FIM_SUFFIX}{suffix}{FIM_MIDDLE}"
 
 
 class MockExLlamaEngine:
@@ -105,6 +130,7 @@ class MockExLlamaEngine:
     def generate_autocomplete_stream(
         self,
         document_text: str,
+        cursor_char_index: int,
         cancel_event: Any,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Iterator[str]:
@@ -262,10 +288,11 @@ class RealExLlamaEngine:
     def generate_autocomplete_stream(
         self,
         document_text: str,
+        cursor_char_index: int,
         cancel_event: Any,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Iterator[str]:
-        prompt = self._build_autocomplete_prompt(document_text)
+        prompt = build_qwen_fim_prompt(document_text, cursor_char_index)
         prompt_token_ids = self._encode_prompt(prompt)
         if not prompt_token_ids:
             return
@@ -349,28 +376,6 @@ class RealExLlamaEngine:
                 dtype=self.torch.long,
             )
 
-    def _build_autocomplete_prompt(self, document_text: str) -> str:
-        mode = os.getenv("AUTOCOMPLETE_PROMPT_MODE", "auto").strip().lower()
-        is_instruct_model = "instruct" in self.model_dir.lower()
-
-        if mode == "raw" or (mode == "auto" and not is_instruct_model):
-            return document_text
-
-        return (
-            "<|im_start|>system\n"
-            "You are inline autocomplete for a plain text editor. Continue "
-            "the user's text with only the next natural words. Do not answer "
-            "the user. Do not add labels, bullets, numbering, markdown, or "
-            "explanations. Keep the continuation short.\n"
-            "<|im_end|>\n"
-            "<|im_start|>user\n"
-            "Continue this text exactly from the cursor. Return only the "
-            "continuation, without repeating the text.\n\n"
-            f"{document_text}\n"
-            "<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-
     def _encode_prompt(self, prompt: str) -> list[int]:
         encode_attempts = (
             {"add_bos": False, "add_eos": False, "encode_special_tokens": True},
@@ -396,19 +401,7 @@ class RealExLlamaEngine:
         return [int(token_id) for token_id in encoded]
 
     def _autocomplete_stop_conditions(self) -> list[Any]:
-        stop_conditions: list[Any] = [
-            "<|im_end|>",
-            "<|endoftext|>",
-            "</s>",
-            "User:",
-            "user:",
-            "Assistant:",
-            "assistant:",
-            "Human:",
-            "human:",
-            "Dear user",
-            "Dear User",
-        ]
+        stop_conditions: list[Any] = list(QWEN_FIM_STOP_STRINGS)
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         if eos_token_id is not None:
             stop_conditions.append(eos_token_id)
