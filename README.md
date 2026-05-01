@@ -388,6 +388,7 @@ If installation is slow or fails, use a prebuilt wheel matching your Python, PyT
 - Qwen autocomplete uses an 8-bit KV cache to keep the fast path small.
 - Llama rewrite target/draft use Q4 KV caches because ExLlamaV2's dynamic/speculative generator rejects 8-bit caches.
 - Speculative rewrite uses the synchronous dynamic job queue: `ExLlamaV2DynamicJob`, `generator.enqueue(job)`, and `generator.iterate()`.
+- Draft acceptance is read from `ExLlamaV2DynamicJob.accepted_draft_tokens` and `rejected_draft_tokens`.
 - If startup fails with `Dynamic generator does not currently work with 8-bit cache`, make sure the code is using the rewrite Q4 cache path and restart the backend.
 
 ### Recommended stack notes
