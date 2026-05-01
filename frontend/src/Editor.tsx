@@ -143,6 +143,7 @@ export function Editor() {
   const lastSentTextRef = useRef('')
   const lastSentCursorRef = useRef(0)
   const suppressIncomingTokensRef = useRef(false)
+  const suppressEditorSyncRef = useRef(false)
   const activeRewriteRequestIdRef = useRef<string | null>(null)
   const tokenChunkIdRef = useRef(0)
   const rewriteChunkIdRef = useRef(0)
@@ -174,6 +175,7 @@ export function Editor() {
         rewriteDoneIdRef.current += 1
         setRewriteDoneId(rewriteDoneIdRef.current)
         activeRewriteRequestIdRef.current = null
+        suppressEditorSyncRef.current = false
       }
 
       console.info('editor socket rewrite message', payload)
@@ -244,7 +246,17 @@ export function Editor() {
 
       if (requestId) {
         activeRewriteRequestIdRef.current = requestId
+        suppressEditorSyncRef.current = true
         suppressIncomingTokensRef.current = true
+        pendingEditRef.current = null
+        if (debounceTimerRef.current !== null) {
+          window.clearTimeout(debounceTimerRef.current)
+          debounceTimerRef.current = null
+        }
+        if (autocompleteTimerRef.current !== null) {
+          window.clearTimeout(autocompleteTimerRef.current)
+          autocompleteTimerRef.current = null
+        }
         setTokenChunk(null)
         setRewriteChunk(null)
       }
@@ -404,6 +416,19 @@ export function Editor() {
           <OnChangePlugin
             ignoreSelectionChange={false}
             onChange={(editorState) => {
+              if (suppressEditorSyncRef.current) {
+                if (debounceTimerRef.current !== null) {
+                  window.clearTimeout(debounceTimerRef.current)
+                  debounceTimerRef.current = null
+                }
+                if (autocompleteTimerRef.current !== null) {
+                  window.clearTimeout(autocompleteTimerRef.current)
+                  autocompleteTimerRef.current = null
+                }
+                pendingEditRef.current = null
+                return
+              }
+
               let shouldAutocomplete = false
               let text = ''
               let cursorCharIndex = 0
