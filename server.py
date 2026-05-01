@@ -262,6 +262,12 @@ class GenerationTaskManager:
         except Exception as exc:
             failed = True
             exit_reason = f"exception:{type(exc).__name__}"
+            print(
+                "Generation exception: "
+                f"action={payload.action} request_id={payload.request_id} "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
             await self.safe_send_stream_payload(
                 request_id=payload.request_id,
                 payload_type="server_error",

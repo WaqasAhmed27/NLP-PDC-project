@@ -233,6 +233,13 @@ def _int_attr(obj: Any, name: str) -> Optional[int]:
     return None
 
 
+def _first_present_value(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in payload and payload[key] is not None:
+            return payload[key]
+    return None
+
+
 class MockExLlamaEngine:
     """CPU-only stand-in with API parity for local WebSocket development."""
 
@@ -810,11 +817,9 @@ class RealExLlamaEngine:
     ) -> None:
         details = ""
         if result is not None:
-            token_id = (
-                result.get("token")
-                or result.get("token_id")
-                or result.get("id")
-                or result.get("ids")
+            token_id = _first_present_value(
+                result,
+                ("token", "token_id", "id", "ids"),
             )
             if token_id is not None:
                 details = f" token={token_id!r}"
@@ -854,7 +859,7 @@ class RealExLlamaEngine:
             "eos": result.get("eos"),
             "chunk_len": len(chunk),
             "chunk_repr": chunk[:160],
-            "token": result.get("token") or result.get("token_id") or result.get("id"),
+            "token": _first_present_value(result, ("token", "token_id", "id")),
         }
 
     def _rewrite_job_debug(self, job: Any) -> dict[str, Any]:
@@ -893,11 +898,9 @@ class RealExLlamaEngine:
         if explicit_count is not None and explicit_count > 0:
             return explicit_count
 
-        token_ids = (
-            result.get("token_ids")
-            or result.get("tokens_ids")
-            or result.get("ids")
-            or result.get("token")
+        token_ids = _first_present_value(
+            result,
+            ("token_ids", "tokens_ids", "ids", "token"),
         )
         if hasattr(token_ids, "numel"):
             return int(token_ids.numel())
