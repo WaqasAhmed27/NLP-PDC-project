@@ -309,6 +309,7 @@ class RealExLlamaEngine:
         self._qwen_last_token_id: Optional[int] = None
         self._qwen_next_logits: Optional[Any] = None
         self.requires_full_prefill = False
+        self._logged_rewrite_introspection = False
         self.speculative_draft_tokens = _env_int(
             "SPECULATIVE_DRAFT_TOKENS",
             DEFAULT_SPECULATIVE_DRAFT_TOKENS,
@@ -678,6 +679,7 @@ class RealExLlamaEngine:
                     if result_job is not None and result_job is not job:
                         continue
 
+                    self._log_rewrite_introspection_once(job, result)
                     telemetry.observe_speculative_result(result)
                     chunk = str(result.get("text") or result.get("chunk") or "")
                     if not chunk:
@@ -733,6 +735,38 @@ class RealExLlamaEngine:
             if token_id is not None:
                 details = f" token={token_id!r}"
         print(f"[HEAVY-PATH] Stop reason: {reason}{details}", flush=True)
+
+    def _log_rewrite_introspection_once(
+        self,
+        job: Any,
+        result: dict[str, Any],
+    ) -> None:
+        if self._logged_rewrite_introspection:
+            return
+
+        self._logged_rewrite_introspection = True
+        print(
+            f"[HEAVY-PATH] result keys: {sorted(result.keys())}",
+            flush=True,
+        )
+        print(
+            "[HEAVY-PATH] job speculative attrs: "
+            f"{self._speculative_attr_names(job)}",
+            flush=True,
+        )
+        print(
+            "[HEAVY-PATH] generator speculative attrs: "
+            f"{self._speculative_attr_names(self.rewrite_generator)}",
+            flush=True,
+        )
+
+    def _speculative_attr_names(self, obj: Any) -> list[str]:
+        interesting_terms = ("accept", "draft", "spec")
+        return sorted(
+            name
+            for name in dir(obj)
+            if any(term in name.lower() for term in interesting_terms)
+        )
 
     def _rewrite_stop_conditions(self) -> list[Any]:
         stop_conditions: list[Any] = list(LLAMA_REWRITE_STOP_STRINGS)
