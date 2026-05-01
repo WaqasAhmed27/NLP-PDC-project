@@ -27,6 +27,7 @@ DEFAULT_REWRITE_TEMPERATURE = 0.2
 DEFAULT_REWRITE_TOP_P = 0.8
 DEFAULT_REWRITE_TOP_K = 40
 DEFAULT_REWRITE_REPETITION_PENALTY = 1.05
+DEFAULT_REWRITE_MAX_NEW_TOKENS = 128
 DEFAULT_SPECULATIVE_DRAFT_TOKENS = 4
 DEFAULT_HEAVY_DEBUG_RESULTS = 12
 HEAVY_DEBUG_EMPTY_RESULT_INTERVAL = 1000
@@ -48,15 +49,7 @@ LLAMA_REWRITE_STOP_STRINGS = (
     "<|eot_id|>",
     "<|end_of_text|>",
     "<|start_header_id|>",
-    "<|end_header_id|>",
     "<|reserved_special_token",
-    "\nassistant",
-    "\nAssistant",
-    ".assistant",
-    "assistant\n",
-    "Here is the rewritten:",
-    "Here is the text:",
-    "Here is text",
 )
 LLAMA3_STOP_TOKEN_IDS = (
     128001,  # <|end_of_text|>
@@ -308,7 +301,7 @@ class MockExLlamaEngine:
         text: str,
         instruction: str,
         cancel_event: Any,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = DEFAULT_REWRITE_MAX_NEW_TOKENS,
     ) -> Iterator[str]:
         chunks = [f"Rewritten ({instruction}): ", text]
         for chunk in chunks:
@@ -672,13 +665,13 @@ class RealExLlamaEngine:
         job_candidates = (
             {
                 "input_ids": input_tensor,
-                "banned_strings": list(LLAMA_REWRITE_STOP_STRINGS),
+                "stop_conditions": self._rewrite_stop_conditions(),
                 "gen_settings": self.rewrite_sampling_settings,
                 "max_new_tokens": max_new_tokens,
             },
             {
                 "input_ids": input_tensor,
-                "stop_conditions": self._rewrite_stop_conditions(),
+                "banned_strings": list(LLAMA_REWRITE_STOP_STRINGS),
                 "gen_settings": self.rewrite_sampling_settings,
                 "max_new_tokens": max_new_tokens,
             },

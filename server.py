@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 load_dotenv()
 
 from engine import get_engine
+from engine import DEFAULT_REWRITE_MAX_NEW_TOKENS
 from editor_state_manager import EditorStateManager
 
 
@@ -339,7 +340,7 @@ class GenerationTaskManager:
                 payload.text,
                 payload.prompt,
                 cancel_event,
-                512,
+                DEFAULT_REWRITE_MAX_NEW_TOKENS,
             )
 
         return await asyncio.to_thread(
