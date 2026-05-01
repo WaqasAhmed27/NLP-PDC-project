@@ -9,12 +9,11 @@ non-GPU machines.
 from __future__ import annotations
 
 import os
-import asyncio
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Optional
+from typing import Any, Iterator, Optional
 
 
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
@@ -338,7 +337,7 @@ class RealExLlamaEngine:
             )
             from exllamav2.generator import (
                 ExLlamaV2DynamicGenerator,
-                ExLlamaV2DynamicJobAsync,
+                ExLlamaV2DynamicJob,
                 ExLlamaV2Sampler,
                 ExLlamaV2StreamingGenerator,
             )
@@ -362,7 +361,7 @@ class RealExLlamaEngine:
         self.sampler_cls = ExLlamaV2Sampler
         self.streaming_generator_cls = ExLlamaV2StreamingGenerator
         self.dynamic_generator_cls = ExLlamaV2DynamicGenerator
-        self.dynamic_job_async_cls = ExLlamaV2DynamicJobAsync
+        self.dynamic_job_cls = ExLlamaV2DynamicJob
 
         # Load largest first to reduce VRAM fragmentation.
         self.llama_target = self._load_model_bundle(
@@ -598,18 +597,42 @@ class RealExLlamaEngine:
             return
         input_tensor = self.torch.tensor([input_ids], dtype=self.torch.long)
 
-        job = self.dynamic_job_async_cls(
-            self.rewrite_generator,
-            input_ids=input_tensor,
-            banned_strings=list(LLAMA_REWRITE_STOP_STRINGS),
-            gen_settings=self.rewrite_sampling_settings,
-            max_new_tokens=max_new_tokens,
-        )
+        job = self._build_rewrite_job(input_tensor, max_new_tokens)
 
         try:
             yield from self._consume_dynamic_job(job, cancel_event, telemetry)
         finally:
             telemetry.log()
+
+    def _build_rewrite_job(self, input_tensor: Any, max_new_tokens: int) -> Any:
+        job_candidates = (
+            {
+                "input_ids": input_tensor,
+                "banned_strings": list(LLAMA_REWRITE_STOP_STRINGS),
+                "gen_settings": self.rewrite_sampling_settings,
+                "max_new_tokens": max_new_tokens,
+            },
+            {
+                "input_ids": input_tensor,
+                "stop_conditions": self._rewrite_stop_conditions(),
+                "gen_settings": self.rewrite_sampling_settings,
+                "max_new_tokens": max_new_tokens,
+            },
+            {
+                "input_ids": input_tensor,
+                "gen_settings": self.rewrite_sampling_settings,
+                "max_new_tokens": max_new_tokens,
+            },
+        )
+
+        last_error: Optional[TypeError] = None
+        for kwargs in job_candidates:
+            try:
+                return self.dynamic_job_cls(**kwargs)
+            except TypeError as exc:
+                last_error = exc
+
+        raise RuntimeError("Could not initialize ExLlamaV2 dynamic rewrite job") from last_error
 
     def _consume_dynamic_job(
         self,
@@ -617,33 +640,41 @@ class RealExLlamaEngine:
         cancel_event: Any,
         telemetry: TelemetryStats,
     ) -> Iterator[str]:
-        loop = asyncio.new_event_loop()
-        iterator: AsyncIterator[Any] = job.__aiter__()
+        with self.gpu_lock, self.torch.inference_mode():
+            self.rewrite_generator.enqueue(job)
+
         try:
             while not cancel_event.is_set():
-                try:
-                    result = loop.run_until_complete(iterator.__anext__())
-                except StopAsyncIteration:
-                    break
+                with self.gpu_lock, self.torch.inference_mode():
+                    results = self.rewrite_generator.iterate()
 
-                telemetry.observe_speculative_result(result)
-                chunk = str(result.get("text") or result.get("chunk") or "")
-                if not chunk:
-                    if result.get("eos", False):
-                        break
+                if not results:
                     continue
 
-                trimmed_chunk, should_stop = self._trim_at_rewrite_stop(chunk)
-                if trimmed_chunk:
-                    telemetry.observe_chunk(
-                        trimmed_chunk,
-                        self._result_token_count(result),
-                    )
-                    yield trimmed_chunk
-                if should_stop or result.get("eos", False):
-                    break
+                for result in results:
+                    result_job = result.get("job")
+                    if result_job is not None and result_job is not job:
+                        continue
+
+                    telemetry.observe_speculative_result(result)
+                    chunk = str(result.get("text") or result.get("chunk") or "")
+                    if not chunk:
+                        if result.get("eos", False):
+                            return
+                        continue
+
+                    trimmed_chunk, should_stop = self._trim_at_rewrite_stop(chunk)
+                    if trimmed_chunk:
+                        telemetry.observe_chunk(
+                            trimmed_chunk,
+                            self._result_token_count(result),
+                        )
+                        yield trimmed_chunk
+                    if should_stop or result.get("eos", False):
+                        return
         finally:
-            loop.close()
+            if cancel_event.is_set() and hasattr(job, "cancel"):
+                job.cancel()
 
     def _trim_at_rewrite_stop(self, chunk: str) -> tuple[str, bool]:
         stop_index: Optional[int] = None
@@ -655,6 +686,13 @@ class RealExLlamaEngine:
         if stop_index is None:
             return chunk, False
         return chunk[:stop_index], True
+
+    def _rewrite_stop_conditions(self) -> list[Any]:
+        stop_conditions: list[Any] = list(LLAMA_REWRITE_STOP_STRINGS)
+        eos_token_id = getattr(self.llama_target.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            stop_conditions.append(eos_token_id)
+        return stop_conditions
 
     def _result_token_count(self, result: dict[str, Any]) -> int:
         explicit_count = _first_int_value(
