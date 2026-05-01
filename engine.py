@@ -332,6 +332,7 @@ class RealExLlamaEngine:
             from exllamav2 import (
                 ExLlamaV2,
                 ExLlamaV2Cache_8bit,
+                ExLlamaV2Cache_Q4,
                 ExLlamaV2Config,
                 ExLlamaV2Tokenizer,
             )
@@ -353,7 +354,8 @@ class RealExLlamaEngine:
             ) from exc
 
         self.torch = torch
-        self.cache_cls = ExLlamaV2Cache_8bit
+        self.qwen_cache_cls = ExLlamaV2Cache_8bit
+        self.rewrite_cache_cls = ExLlamaV2Cache_Q4
         self.config_cls = ExLlamaV2Config
         self.model_cls = ExLlamaV2
         self.tokenizer_cls = ExLlamaV2Tokenizer
@@ -367,16 +369,22 @@ class RealExLlamaEngine:
             "LLAMA_REWRITE_TARGET_MODEL_DIR",
             llama_target_model_dir,
             load_tokenizer=True,
+            cache_cls=self.rewrite_cache_cls,
+            cache_name="Q4 rewrite target",
         )
         self.qwen = self._load_model_bundle(
             "QWEN_AUTOCOMPLETE_MODEL_DIR",
             qwen_model_dir,
             load_tokenizer=True,
+            cache_cls=self.qwen_cache_cls,
+            cache_name="8-bit Qwen autocomplete",
         )
         self.llama_draft = self._load_model_bundle(
             "LLAMA_REWRITE_DRAFT_MODEL_DIR",
             llama_draft_model_dir,
             load_tokenizer=False,
+            cache_cls=self.rewrite_cache_cls,
+            cache_name="Q4 rewrite draft",
         )
 
         self.qwen_generator = self.streaming_generator_cls(
@@ -413,6 +421,8 @@ class RealExLlamaEngine:
         model_dir: str,
         *,
         load_tokenizer: bool,
+        cache_cls: Any,
+        cache_name: str,
     ) -> ModelBundle:
         resolved_model_dir = str(Path(model_dir).expanduser())
         if not Path(resolved_model_dir).exists():
@@ -425,7 +435,7 @@ class RealExLlamaEngine:
             config.arch_compat_overrides()
 
         model = self.model_cls(config)
-        cache = self._build_cache(model)
+        cache = self._build_cache(model, cache_cls, cache_name)
         if hasattr(model, "load_autosplit"):
             model.load_autosplit(cache)
         else:
@@ -440,7 +450,7 @@ class RealExLlamaEngine:
             tokenizer=tokenizer,
         )
 
-    def _build_cache(self, model: Any) -> Any:
+    def _build_cache(self, model: Any, cache_cls: Any, cache_name: str) -> Any:
         candidates = (
             {"batch_size": 1, "max_seq_len": self.max_seq_len, "lazy": True},
             {"max_seq_len": self.max_seq_len, "lazy": True},
@@ -451,11 +461,11 @@ class RealExLlamaEngine:
 
         for kwargs in candidates:
             try:
-                return self.cache_cls(model, **kwargs)
+                return cache_cls(model, **kwargs)
             except TypeError as exc:
                 last_error = exc
 
-        raise RuntimeError("Could not initialize ExLlamaV2 8-bit cache") from last_error
+        raise RuntimeError(f"Could not initialize ExLlamaV2 {cache_name} cache") from last_error
 
     def _build_tokenizer(self, config: Any) -> Any:
         try:

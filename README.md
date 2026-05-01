@@ -383,6 +383,12 @@ paged attention available: True
 
 If installation is slow or fails, use a prebuilt wheel matching your Python, PyTorch, and CUDA versions.
 
+### Cache mode notes
+
+- Qwen autocomplete uses an 8-bit KV cache to keep the fast path small.
+- Llama rewrite target/draft use Q4 KV caches because ExLlamaV2's dynamic/speculative generator rejects 8-bit caches.
+- If startup fails with `Dynamic generator does not currently work with 8-bit cache`, make sure the code is using the rewrite Q4 cache path and restart the backend.
+
 ### Recommended stack notes
 
 - GPU: NVIDIA RTX 3090 or RTX 4090
@@ -402,6 +408,7 @@ If installation is slow or fails, use a prebuilt wheel matching your Python, PyT
 - `torch.cuda.is_available() == False`: wrong PyTorch build, missing driver, or container does not expose the GPU.
 - ExLlamaV2 import/build errors: Python/PyTorch/CUDA wheel mismatch.
 - `Paged attention required Flash Attention 2.5.7 or later`: install or upgrade `flash-attn` inside the active venv.
+- `Dynamic generator does not currently work with 8-bit cache`: rewrite target/draft must use Q4 or FP16 cache; the current backend uses Q4 for rewrite.
 - `KeyError: 'cuda:0'`: cache/model split or device registration issue; verify model loading and ExLlamaV2 version.
 - Repeated nonsense tokens: test the same FIM prompt through TabbyAPI; if Tabby also fails, suspect model/quant/settings.
 - `Assistant:` or `Dear user` in output: you are probably using an instruct/chat model or a chat prompt path, not FIM with a base Coder model.
