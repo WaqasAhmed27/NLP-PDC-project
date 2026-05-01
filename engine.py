@@ -105,6 +105,94 @@ class ModelBundle:
     tokenizer: Any | None = None
 
 
+@dataclass
+class TelemetryStats:
+    label: str
+    started_at: float
+    first_token_at: Optional[float] = None
+    tokens: int = 0
+    draft_tokens: int = 0
+    accepted_tokens: int = 0
+
+    def observe_chunk(self, chunk: str, token_count: int = 1) -> None:
+        if not chunk:
+            return
+        if self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
+        self.tokens += max(1, token_count)
+
+    def observe_speculative_result(self, result: dict[str, Any]) -> None:
+        draft_tokens = _first_int_value(
+            result,
+            (
+                "draft_tokens",
+                "num_draft_tokens",
+                "drafted_tokens",
+                "attempted_draft_tokens",
+            ),
+        )
+        accepted_tokens = _first_int_value(
+            result,
+            (
+                "accepted_tokens",
+                "num_accepted_tokens",
+                "accepted_draft_tokens",
+                "draft_tokens_accepted",
+            ),
+        )
+        if draft_tokens is not None:
+            self.draft_tokens += draft_tokens
+        if accepted_tokens is not None:
+            self.accepted_tokens += accepted_tokens
+
+    def log(self) -> None:
+        ended_at = time.perf_counter()
+        total_ms = int((ended_at - self.started_at) * 1000)
+        ttft_ms = (
+            int((self.first_token_at - self.started_at) * 1000)
+            if self.first_token_at is not None
+            else total_ms
+        )
+        generation_seconds = (
+            ended_at - self.first_token_at
+            if self.first_token_at is not None
+            else 0.0
+        )
+        tps = self.tokens / generation_seconds if generation_seconds > 0 else 0.0
+
+        if self.label == "HEAVY-PATH":
+            acceptance_rate = (
+                (self.accepted_tokens / self.draft_tokens) * 100
+                if self.draft_tokens > 0
+                else 0.0
+            )
+            print(
+                f"[{self.label}] TTFT: {ttft_ms}ms | TPS: {tps:.1f} | "
+                f"Draft Acceptance: {acceptance_rate:.0f}% | "
+                f"Total Time: {total_ms}ms | Tokens: {self.tokens}",
+                flush=True,
+            )
+            return
+
+        print(
+            f"[{self.label}] TTFT: {ttft_ms}ms | TPS: {tps:.1f} | "
+            f"Total Time: {total_ms}ms | Tokens: {self.tokens}",
+            flush=True,
+        )
+
+
+def _first_int_value(payload: dict[str, Any], keys: tuple[str, ...]) -> Optional[int]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+    return None
+
+
 class MockExLlamaEngine:
     """CPU-only stand-in with API parity for local WebSocket development."""
 
@@ -443,38 +531,47 @@ class RealExLlamaEngine:
         cancel_event: Any,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Iterator[str]:
+        telemetry = TelemetryStats("FAST-PATH", time.perf_counter())
         prompt = build_qwen_fim_prompt(document_text, cursor_char_index)
         prompt_token_ids = self._encode_prompt(self.qwen.tokenizer, prompt)
         if not prompt_token_ids:
+            telemetry.log()
             return
 
         input_ids = self.torch.tensor([prompt_token_ids], dtype=self.torch.long)
 
-        with self.gpu_lock, self.torch.inference_mode():
-            self.qwen_generator.set_stop_conditions(self._autocomplete_stop_conditions())
-            self.qwen_generator.begin_stream_ex(
-                input_ids,
-                self.qwen_sampling_settings,
-                token_healing=True,
-            )
-            self.current_seq_len = self.qwen.cache.current_seq_len
-            self._qwen_last_token_id = int(prompt_token_ids[-1])
-            self._qwen_next_logits = None
-            self.requires_full_prefill = True
-
-        for _ in range(max_new_tokens):
-            if cancel_event.is_set():
-                break
-
+        try:
             with self.gpu_lock, self.torch.inference_mode():
-                result = self.qwen_generator.stream_ex()
+                self.qwen_generator.set_stop_conditions(self._autocomplete_stop_conditions())
+                self.qwen_generator.begin_stream_ex(
+                    input_ids,
+                    self.qwen_sampling_settings,
+                    token_healing=True,
+                )
                 self.current_seq_len = self.qwen.cache.current_seq_len
+                self._qwen_last_token_id = int(prompt_token_ids[-1])
+                self._qwen_next_logits = None
+                self.requires_full_prefill = True
 
-            chunk = result.get("chunk", "")
-            if chunk:
-                yield chunk
-            if result.get("eos", False):
-                break
+            for _ in range(max_new_tokens):
+                if cancel_event.is_set():
+                    break
+
+                with self.gpu_lock, self.torch.inference_mode():
+                    result = self.qwen_generator.stream_ex()
+                    self.current_seq_len = self.qwen.cache.current_seq_len
+
+                chunk = result.get("chunk", "")
+                if chunk:
+                    telemetry.observe_chunk(
+                        chunk,
+                        self._result_token_count(result),
+                    )
+                    yield chunk
+                if result.get("eos", False):
+                    break
+        finally:
+            telemetry.log()
 
     def apply_rewrite(
         self,
@@ -483,9 +580,11 @@ class RealExLlamaEngine:
         cancel_event: Any,
         max_new_tokens: int = 512,
     ) -> Iterator[str]:
+        telemetry = TelemetryStats("HEAVY-PATH", time.perf_counter())
         prompt = build_llama_rewrite_prompt(text, instruction)
         input_ids = self._encode_prompt(self.llama_target.tokenizer, prompt)
         if not input_ids:
+            telemetry.log()
             return
         input_tensor = self.torch.tensor([input_ids], dtype=self.torch.long)
 
@@ -497,9 +596,17 @@ class RealExLlamaEngine:
             max_new_tokens=max_new_tokens,
         )
 
-        yield from self._consume_dynamic_job(job, cancel_event)
+        try:
+            yield from self._consume_dynamic_job(job, cancel_event, telemetry)
+        finally:
+            telemetry.log()
 
-    def _consume_dynamic_job(self, job: Any, cancel_event: Any) -> Iterator[str]:
+    def _consume_dynamic_job(
+        self,
+        job: Any,
+        cancel_event: Any,
+        telemetry: TelemetryStats,
+    ) -> Iterator[str]:
         loop = asyncio.new_event_loop()
         iterator: AsyncIterator[Any] = job.__aiter__()
         try:
@@ -509,6 +616,7 @@ class RealExLlamaEngine:
                 except StopAsyncIteration:
                     break
 
+                telemetry.observe_speculative_result(result)
                 chunk = str(result.get("text") or result.get("chunk") or "")
                 if not chunk:
                     if result.get("eos", False):
@@ -517,6 +625,10 @@ class RealExLlamaEngine:
 
                 trimmed_chunk, should_stop = self._trim_at_rewrite_stop(chunk)
                 if trimmed_chunk:
+                    telemetry.observe_chunk(
+                        trimmed_chunk,
+                        self._result_token_count(result),
+                    )
                     yield trimmed_chunk
                 if should_stop or result.get("eos", False):
                     break
@@ -533,6 +645,35 @@ class RealExLlamaEngine:
         if stop_index is None:
             return chunk, False
         return chunk[:stop_index], True
+
+    def _result_token_count(self, result: dict[str, Any]) -> int:
+        explicit_count = _first_int_value(
+            result,
+            (
+                "tokens",
+                "num_tokens",
+                "new_tokens",
+                "generated_tokens",
+                "token_count",
+            ),
+        )
+        if explicit_count is not None and explicit_count > 0:
+            return explicit_count
+
+        token_ids = (
+            result.get("token_ids")
+            or result.get("tokens_ids")
+            or result.get("ids")
+            or result.get("token")
+        )
+        if hasattr(token_ids, "numel"):
+            return int(token_ids.numel())
+        if isinstance(token_ids, (list, tuple)):
+            return max(1, len(token_ids))
+        if isinstance(token_ids, int):
+            return 1
+
+        return 1
 
     def generate_stream(
         self,
