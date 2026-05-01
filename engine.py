@@ -58,7 +58,6 @@ LLAMA_REWRITE_STOP_STRINGS = (
 )
 LLAMA3_STOP_TOKEN_IDS = (
     128001,  # <|end_of_text|>
-    128008,
     128009,  # <|eot_id|>
 )
 
@@ -105,7 +104,8 @@ def build_llama_rewrite_prompt(text: str, instruction: str) -> str:
         "according to the user's instruction. Output only the final rewritten "
         "text. Do not add a preface, label, explanation, quote marks, markdown, "
         "or alternate version. Preserve the original meaning and fill in all "
-        "necessary words so the sentence is grammatical."
+        "necessary words so the sentence is grammatical. The output must be "
+        "one complete sentence or paragraph, not a fragment."
         "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
         f"Instruction: {instruction}\n\n"
         f"Selected text:\n{text}\n\n"
@@ -682,32 +682,57 @@ class RealExLlamaEngine:
                     chunk = str(result.get("text") or result.get("chunk") or "")
                     if not chunk:
                         if result.get("eos", False):
+                            self._log_rewrite_stop("eos", result)
                             return
                         continue
 
-                    trimmed_chunk, should_stop = self._trim_at_rewrite_stop(chunk)
+                    trimmed_chunk, stop_string = self._trim_at_rewrite_stop(chunk)
                     if trimmed_chunk:
                         telemetry.observe_chunk(
                             trimmed_chunk,
                             self._result_token_count(result),
                         )
                         yield trimmed_chunk
-                    if should_stop or result.get("eos", False):
+                    if stop_string:
+                        self._log_rewrite_stop(f"text stop {stop_string!r}", result)
+                        return
+                    if result.get("eos", False):
+                        self._log_rewrite_stop("eos", result)
                         return
         finally:
             if cancel_event.is_set() and hasattr(job, "cancel"):
+                self._log_rewrite_stop("cancelled")
                 job.cancel()
 
-    def _trim_at_rewrite_stop(self, chunk: str) -> tuple[str, bool]:
+    def _trim_at_rewrite_stop(self, chunk: str) -> tuple[str, Optional[str]]:
         stop_index: Optional[int] = None
+        matched_stop: Optional[str] = None
         for stop_string in LLAMA_REWRITE_STOP_STRINGS:
             index = chunk.find(stop_string)
             if index != -1 and (stop_index is None or index < stop_index):
                 stop_index = index
+                matched_stop = stop_string
 
         if stop_index is None:
-            return chunk, False
-        return chunk[:stop_index], True
+            return chunk, None
+        return chunk[:stop_index], matched_stop
+
+    def _log_rewrite_stop(
+        self,
+        reason: str,
+        result: Optional[dict[str, Any]] = None,
+    ) -> None:
+        details = ""
+        if result is not None:
+            token_id = (
+                result.get("token")
+                or result.get("token_id")
+                or result.get("id")
+                or result.get("ids")
+            )
+            if token_id is not None:
+                details = f" token={token_id!r}"
+        print(f"[HEAVY-PATH] Stop reason: {reason}{details}", flush=True)
 
     def _rewrite_stop_conditions(self) -> list[Any]:
         stop_conditions: list[Any] = list(LLAMA_REWRITE_STOP_STRINGS)

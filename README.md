@@ -413,6 +413,7 @@ If installation is slow or fails, use a prebuilt wheel matching your Python, PyT
 - `ExLlamaV2DynamicJobAsync object has no attribute prepare_for_queue`: use the synchronous dynamic job queue path; async jobs can be incompatible with the installed ExLlamaV2 release.
 - Fast path only emits `"\n"` and stops: disable token healing for FIM autocomplete so `<|fim_middle|>` remains intact.
 - Rewrite output starts with `Here is...` or leaks `assistant`: lower rewrite sampling and ensure Llama 3 stop token IDs include `128009` for `<|eot_id|>`.
+- Rewrite stops after a short fragment: check the `[HEAVY-PATH] Stop reason` log; avoid treating Llama 3 `128008` as a normal rewrite stop.
 - `KeyError: 'cuda:0'`: cache/model split or device registration issue; verify model loading and ExLlamaV2 version.
 - Repeated nonsense tokens: test the same FIM prompt through TabbyAPI; if Tabby also fails, suspect model/quant/settings.
 - `Assistant:` or `Dear user` in output: you are probably using an instruct/chat model or a chat prompt path, not FIM with a base Coder model.
