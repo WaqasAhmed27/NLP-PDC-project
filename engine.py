@@ -23,9 +23,9 @@ DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TOP_P = 0.9
 DEFAULT_TOP_K = 40
 DEFAULT_REPETITION_PENALTY = 1.05
-DEFAULT_REWRITE_TEMPERATURE = 0.7
-DEFAULT_REWRITE_TOP_P = 0.9
-DEFAULT_REWRITE_TOP_K = 50
+DEFAULT_REWRITE_TEMPERATURE = 0.2
+DEFAULT_REWRITE_TOP_P = 0.8
+DEFAULT_REWRITE_TOP_K = 40
 DEFAULT_REWRITE_REPETITION_PENALTY = 1.05
 DEFAULT_SPECULATIVE_DRAFT_TOKENS = 4
 FIM_PREFIX = "<|fim_prefix|>"
@@ -45,6 +45,21 @@ QWEN_FIM_STOP_STRINGS = (
 LLAMA_REWRITE_STOP_STRINGS = (
     "<|eot_id|>",
     "<|end_of_text|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|reserved_special_token",
+    "\nassistant",
+    "\nAssistant",
+    ".assistant",
+    "assistant\n",
+    "Here is the rewritten:",
+    "Here is the text:",
+    "Here is text",
+)
+LLAMA3_STOP_TOKEN_IDS = (
+    128001,  # <|end_of_text|>
+    128008,
+    128009,  # <|eot_id|>
 )
 
 
@@ -86,11 +101,15 @@ def build_qwen_fim_prompt(document_text: str, cursor_char_index: int) -> str:
 def build_llama_rewrite_prompt(text: str, instruction: str) -> str:
     return (
         "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-        "You rewrite selected text according to the user's instruction. "
-        "Return only the rewritten text."
+        "You are a precise text rewriting engine. Rewrite the selected text "
+        "according to the user's instruction. Output only the final rewritten "
+        "text. Do not add a preface, label, explanation, quote marks, markdown, "
+        "or alternate version. Preserve the original meaning and fill in all "
+        "necessary words so the sentence is grammatical."
         "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-        f"Instruction:\n{instruction}\n\n"
-        f"Text:\n{text}"
+        f"Instruction: {instruction}\n\n"
+        f"Selected text:\n{text}\n\n"
+        "Return only the rewritten selected text."
         "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
 
@@ -160,14 +179,14 @@ class TelemetryStats:
         tps = self.tokens / generation_seconds if generation_seconds > 0 else 0.0
 
         if self.label == "HEAVY-PATH":
-            acceptance_rate = (
-                (self.accepted_tokens / self.draft_tokens) * 100
+            acceptance = (
+                f"{(self.accepted_tokens / self.draft_tokens) * 100:.0f}%"
                 if self.draft_tokens > 0
-                else 0.0
+                else "unavailable"
             )
             print(
                 f"[{self.label}] TTFT: {ttft_ms}ms | TPS: {tps:.1f} | "
-                f"Draft Acceptance: {acceptance_rate:.0f}% | "
+                f"Draft Acceptance: {acceptance} | "
                 f"Total Time: {total_ms}ms | Tokens: {self.tokens}",
                 flush=True,
             )
@@ -694,7 +713,11 @@ class RealExLlamaEngine:
         stop_conditions: list[Any] = list(LLAMA_REWRITE_STOP_STRINGS)
         eos_token_id = getattr(self.llama_target.tokenizer, "eos_token_id", None)
         if eos_token_id is not None:
-            stop_conditions.append(eos_token_id)
+            if isinstance(eos_token_id, (list, tuple, set)):
+                stop_conditions.extend(eos_token_id)
+            else:
+                stop_conditions.append(eos_token_id)
+        stop_conditions.extend(LLAMA3_STOP_TOKEN_IDS)
         return stop_conditions
 
     def _result_token_count(self, result: dict[str, Any]) -> int:

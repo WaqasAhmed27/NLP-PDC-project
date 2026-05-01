@@ -56,6 +56,8 @@ def test_llama_rewrite_prompt_uses_llama_chat_template() -> None:
     assert "<|start_header_id|>assistant<|end_header_id|>" in prompt
     assert "Make this more professional" in prompt
     assert "this is too casual" in prompt
+    assert "Output only the final rewritten text" in prompt
+    assert "Do not add a preface" in prompt
     assert "<|eot_id|>" in prompt
     assert "<|fim_prefix|>" not in prompt
     assert "<|fim_suffix|>" not in prompt
