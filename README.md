@@ -150,22 +150,121 @@ If using separate frontend and backend tunnels, start the frontend with:
 VITE_EDITOR_WS_URL=wss://<backend-tunnel-host>/ws/editor npm run dev -- --host 0.0.0.0
 ```
 
-## Tests
+## Testing Instructions
 
-Run backend tests:
+Run these checks before changing the editor protocol, inference engine, or frontend socket flow.
+
+### Backend Unit Tests
 
 ```bash
 source venv/bin/activate
-pytest test_fim_prompt.py test_editor_state_manager.py
+pytest test_fim_prompt.py test_server_payload.py test_editor_state_manager.py
 ```
 
-Run frontend checks:
+What these cover:
+- `test_fim_prompt.py`: Qwen FIM prompt construction for empty text, cursor-at-end, mid-document insertion, multiline code, and suffix preservation.
+- `test_server_payload.py`: WebSocket payload parsing and routing safety for `edit`, `autocomplete`, and `rewrite`.
+- `test_editor_state_manager.py`: editor text/cache mutation behavior, truncation boundaries, and recovery cases.
+
+### Python Compile Check
+
+```bash
+source venv/bin/activate
+python -m py_compile engine.py server.py editor_state_manager.py test_fim_prompt.py test_server_payload.py
+```
+
+Use this after touching backend imports, ExLlamaV2 integration, or schema code.
+
+### Frontend Checks
 
 ```bash
 cd frontend
 npm run lint
 npm run build
 ```
+
+### Manual Browser Tests
+
+Start the backend and frontend, then open the editor in Chrome.
+
+```bash
+source venv/bin/activate
+python server.py
+```
+
+```bash
+cd frontend
+npm run dev -- --host 0.0.0.0
+```
+
+Run these manual checks:
+
+1. Type text at the end of a line, pause, and confirm ghost text appears inline.
+2. Press `Tab` while ghost text is visible and confirm it commits as normal editable text.
+3. Type any character while ghost text is visible and confirm the ghost text disappears before the typed character lands.
+4. Click to a different line while generation is streaming and confirm the old ghost text disappears.
+5. Select all text with `Ctrl+A`, press `Backspace`, and confirm the backend recovers without an exception.
+6. Highlight a phrase, use the floating rewrite toolbar, and confirm rewrite chunks replace only the selected text.
+7. Cancel the rewrite toolbar and confirm the selection clears without sending a rewrite request.
+
+### WebSocket Payload Checks
+
+Open browser DevTools and watch the WebSocket frames.
+
+Expected fast-path payload:
+
+```json
+{"action":"autocomplete","new_text":"example text","edit_char_index":12}
+```
+
+Expected rewrite payload:
+
+```json
+{"action":"rewrite","text":"selected text","prompt":"Make this sound more professional"}
+```
+
+Expected stream responses:
+
+```json
+{"type":"token","chunk":"..."}
+{"type":"done"}
+```
+
+### GPU Telemetry Checks
+
+When using the real engine, every completed request should print a terminal log.
+
+Fast path:
+
+```text
+[FAST-PATH] TTFT: 38ms | TPS: 45.2 | Total Time: 210ms | Tokens: 12
+```
+
+Heavy path:
+
+```text
+[HEAVY-PATH] TTFT: 120ms | TPS: 32.5 | Draft Acceptance: 78% | Total Time: 1850ms | Tokens: 128
+```
+
+Acceptance targets for Phase 6:
+- Fast-path TTFT should stay near the sub-40ms target on an RTX 4090 with the 1.5B Qwen model.
+- Rewrite should stream steadily without blocking the WebSocket.
+- Draft acceptance should be non-zero when ExLlamaV2 exposes speculative stats for the dynamic generator.
+- No `Assistant`, `Dear user`, chat-role leakage, repeated-character collapse, or FIM token leakage should appear in ghost text.
+
+### TabbyAPI A/B Test
+
+Use this when autocomplete quality is suspicious. It sends the same FIM prompt to TabbyAPI so you can compare model/runtime behavior against the custom backend.
+
+```bash
+source venv/bin/activate
+python tabby_ab_test.py --prefix $'def add(a, b):\n    ' --suffix $'\n'
+```
+
+Interpretation:
+- Tabby good, custom backend bad: debug ExLlama integration, cache, tokenization, stopping, or sampling.
+- Both bad: model, quant, or generation settings are the likely cause.
+- Both good: frontend/backend wiring is probably healthy.
 
 ## TabbyAPI A/B Probe
 
