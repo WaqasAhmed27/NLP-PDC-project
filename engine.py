@@ -28,9 +28,7 @@ DEFAULT_REWRITE_TOP_P = 0.8
 DEFAULT_REWRITE_TOP_K = 40
 DEFAULT_REWRITE_REPETITION_PENALTY = 1.05
 DEFAULT_REWRITE_MAX_NEW_TOKENS = 128
-DEFAULT_SPECULATIVE_DRAFT_TOKENS = 4
-DEFAULT_HEAVY_DEBUG_RESULTS = 12
-HEAVY_DEBUG_EMPTY_RESULT_INTERVAL = 1000
+DEFAULT_SPECULATIVE_DRAFT_TOKENS = 1
 FIM_PREFIX = "<|fim_prefix|>"
 FIM_SUFFIX = "<|fim_suffix|>"
 FIM_MIDDLE = "<|fim_middle|>"
@@ -335,11 +333,6 @@ class RealExLlamaEngine:
             "SPECULATIVE_DRAFT_TOKENS",
             DEFAULT_SPECULATIVE_DRAFT_TOKENS,
         )
-        self.heavy_debug_results = max(
-            0,
-            _env_int("HEAVY_DEBUG_RESULTS", DEFAULT_HEAVY_DEBUG_RESULTS),
-        )
-
         self.qwen_temperature = max(
             0.0,
             _env_float("GENERATION_TEMPERATURE", DEFAULT_TEMPERATURE),
@@ -646,14 +639,6 @@ class RealExLlamaEngine:
         input_tensor = self.torch.tensor([input_ids], dtype=self.torch.long)
 
         job = self._build_rewrite_job(input_tensor, max_new_tokens)
-        self._log_rewrite_start(
-            text=text,
-            instruction=instruction,
-            prompt=prompt,
-            prompt_token_count=len(input_ids),
-            max_new_tokens=max_new_tokens,
-            job=job,
-        )
 
         try:
             yield from self._consume_dynamic_job(job, cancel_event, telemetry)
@@ -700,43 +685,18 @@ class RealExLlamaEngine:
         with self.gpu_lock, self.torch.inference_mode():
             self.rewrite_generator.enqueue(job)
 
-        emitted_chunks = 0
-        emitted_text_chars = 0
-        empty_result_polls = 0
-        result_events = 0
-        loop_started_at = time.perf_counter()
-
         try:
             while not cancel_event.is_set():
                 with self.gpu_lock, self.torch.inference_mode():
                     results = self.rewrite_generator.iterate()
 
                 if not results:
-                    empty_result_polls += 1
-                    if empty_result_polls % HEAVY_DEBUG_EMPTY_RESULT_INTERVAL == 0:
-                        print(
-                            "[HEAVY-PATH-DEBUG] empty iterate results "
-                            f"polls={empty_result_polls} elapsed_ms="
-                            f"{int((time.perf_counter() - loop_started_at) * 1000)} "
-                            f"job={self._rewrite_job_debug(job)}",
-                            flush=True,
-                        )
                     continue
 
                 for result in results:
-                    result_events += 1
                     result_job = result.get("job")
                     if result_job is not None and result_job is not job:
                         continue
-
-                    if result_events <= self.heavy_debug_results:
-                        print(
-                            "[HEAVY-PATH-DEBUG] result "
-                            f"event={result_events} "
-                            f"summary={self._rewrite_result_debug(result)} "
-                            f"job={self._rewrite_job_debug(job)}",
-                            flush=True,
-                        )
 
                     telemetry.observe_speculative_result(result)
                     chunk = str(result.get("text") or result.get("chunk") or "")
@@ -752,16 +712,6 @@ class RealExLlamaEngine:
                             trimmed_chunk,
                             self._result_token_count(result),
                         )
-                        emitted_chunks += 1
-                        emitted_text_chars += len(trimmed_chunk)
-                        if emitted_chunks <= self.heavy_debug_results:
-                            print(
-                                "[HEAVY-PATH-DEBUG] yield "
-                                f"chunk_index={emitted_chunks} "
-                                f"chars={len(trimmed_chunk)} "
-                                f"repr={trimmed_chunk!r}",
-                                flush=True,
-                            )
                         yield trimmed_chunk
                     if stop_string:
                         self._log_rewrite_stop(f"text stop {stop_string!r}", result)
@@ -769,23 +719,7 @@ class RealExLlamaEngine:
                     if result.get("eos", False):
                         self._log_rewrite_stop("eos", result)
                         return
-            if cancel_event.is_set():
-                self._log_rewrite_stop(
-                    "cancel_event_set",
-                    {
-                        "emitted_chunks": emitted_chunks,
-                        "emitted_chars": emitted_text_chars,
-                        "result_events": result_events,
-                    },
-                )
         finally:
-            print(
-                "[HEAVY-PATH-DEBUG] generator exit "
-                f"emitted_chunks={emitted_chunks} emitted_chars={emitted_text_chars} "
-                f"result_events={result_events} empty_polls={empty_result_polls} "
-                f"job={self._rewrite_job_debug(job)}",
-                flush=True,
-            )
             if cancel_event.is_set() and hasattr(job, "cancel"):
                 self._log_rewrite_stop("cancelled")
                 job.cancel()
@@ -817,54 +751,6 @@ class RealExLlamaEngine:
             if token_id is not None:
                 details = f" token={token_id!r}"
         print(f"[HEAVY-PATH] Stop reason: {reason}{details}", flush=True)
-
-    def _log_rewrite_start(
-        self,
-        *,
-        text: str,
-        instruction: str,
-        prompt: str,
-        prompt_token_count: int,
-        max_new_tokens: int,
-        job: Any,
-    ) -> None:
-        print(
-            "[HEAVY-PATH-DEBUG] start "
-            f"text_chars={len(text)} instruction={instruction!r} "
-            f"prompt_tokens={prompt_token_count} max_new_tokens={max_new_tokens} "
-            f"settings=temp:{self.rewrite_temperature} top_p:{self.rewrite_top_p} "
-            f"top_k:{self.rewrite_top_k} rep:{self.rewrite_repetition_penalty} "
-            f"draft_tokens={self.speculative_draft_tokens} "
-            f"job={self._rewrite_job_debug(job)}",
-            flush=True,
-        )
-        print(
-            f"[HEAVY-PATH-DEBUG] prompt_tail={prompt[-500:]!r}",
-            flush=True,
-        )
-
-    def _rewrite_result_debug(self, result: dict[str, Any]) -> dict[str, Any]:
-        chunk = str(result.get("text") or result.get("chunk") or "")
-        return {
-            "keys": sorted(result.keys()),
-            "serial": result.get("serial"),
-            "stage": result.get("stage"),
-            "eos": result.get("eos"),
-            "chunk_len": len(chunk),
-            "chunk_repr": chunk[:160],
-            "token": _first_present_value(result, ("token", "token_id", "id")),
-        }
-
-    def _rewrite_job_debug(self, job: Any) -> dict[str, Any]:
-        return {
-            "accepted": _int_attr(job, "accepted_draft_tokens"),
-            "rejected": _int_attr(job, "rejected_draft_tokens"),
-            "max_new_tokens": _int_attr(job, "max_new_tokens"),
-            "current_length": _int_attr(job, "current_length"),
-            "generated_tokens": _int_attr(job, "generated_tokens"),
-            "eos": getattr(job, "eos", None),
-            "cancelled": getattr(job, "cancelled", None),
-        }
 
     def _rewrite_stop_conditions(self) -> list[Any]:
         stop_conditions: list[Any] = list(LLAMA_REWRITE_STOP_STRINGS)

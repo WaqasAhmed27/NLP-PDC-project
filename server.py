@@ -77,12 +77,6 @@ def _next_token(token_iterator: Iterator[str]) -> Optional[str]:
         return None
 
 
-def _shorten(value: str, limit: int = 120) -> str:
-    if len(value) <= limit:
-        return value
-    return f"{value[:limit]}..."
-
-
 class GenerationTaskManager:
     def __init__(self, websocket: WebSocket, manager: EditorStateManager) -> None:
         self.websocket = websocket
@@ -95,14 +89,6 @@ class GenerationTaskManager:
 
     async def handle_payload(self, payload: EditorPayload) -> None:
         started_at = time.perf_counter()
-        print(
-            "Received payload: "
-            f"action={payload.action} request_id={payload.request_id} "
-            f"new_text_len={len(payload.new_text or '')} "
-            f"text_len={len(payload.text or '')} "
-            f"edit_char_index={payload.edit_char_index}",
-            flush=True,
-        )
 
         if self.is_rewrite_active() and payload.action in {"edit", "autocomplete"}:
             print(
@@ -128,11 +114,6 @@ class GenerationTaskManager:
             self.current_action = "rewrite"
             self.current_task = asyncio.create_task(
                 self.run_generation(payload, cancel_event)
-            )
-            print(
-                f"Started generation: action=rewrite request_id={payload.request_id} "
-                f"text_preview={_shorten(payload.text or '')!r}",
-                flush=True,
             )
             return
 
@@ -161,10 +142,6 @@ class GenerationTaskManager:
         self.current_action = "autocomplete"
         self.current_task = asyncio.create_task(
             self.run_generation(payload, cancel_event)
-        )
-        print(
-            f"Started generation: action=autocomplete request_id={payload.request_id}",
-            flush=True,
         )
 
     def is_rewrite_active(self) -> bool:
@@ -230,7 +207,6 @@ class GenerationTaskManager:
         started_at = time.perf_counter()
         cancelled = False
         failed = False
-        token_count = 0
         exit_reason = "unknown"
 
         try:
@@ -241,7 +217,6 @@ class GenerationTaskManager:
                     exit_reason = "iterator_exhausted"
                     break
 
-                token_count += 1
                 sent = await self.safe_send_stream_payload(
                     request_id=payload.request_id,
                     payload_type="token",
@@ -280,9 +255,7 @@ class GenerationTaskManager:
             print(
                 "Generation finished: "
                 f"action={payload.action} request_id={payload.request_id} "
-                f"tokens_sent={token_count} cancelled={cancelled} failed={failed} "
-                f"exit_reason={exit_reason} elapsed_ms="
-                f"{int((time.perf_counter() - started_at) * 1000)}",
+                f"cancelled={cancelled} failed={failed} exit_reason={exit_reason}",
                 flush=True,
             )
             if cancelled:
