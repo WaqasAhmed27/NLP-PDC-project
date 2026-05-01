@@ -84,14 +84,33 @@ class GenerationTaskManager:
         self.send_lock = asyncio.Lock()
         self.current_task: Optional[asyncio.Task[None]] = None
         self.current_cancel_event: Optional[asyncio.Event] = None
+        self.current_action: Optional[Literal["autocomplete", "rewrite"]] = None
 
     async def handle_payload(self, payload: EditorPayload) -> None:
-        await self.cancel_active_generation()
         started_at = time.perf_counter()
+
+        if self.is_rewrite_active() and payload.action in {"edit", "autocomplete"}:
+            print(
+                "Ignoring payload while rewrite is active: "
+                f"action={payload.action} request_id={payload.request_id}",
+                flush=True,
+            )
+            await self.safe_send_stream_payload(
+                request_id=payload.request_id,
+                payload_type="done",
+                chunk="ignored_while_rewrite_active",
+                started_at=started_at,
+            )
+            return
+
+        await self.cancel_active_generation(
+            reason=f"new_{payload.action}_payload request_id={payload.request_id}"
+        )
 
         if payload.action == "rewrite":
             cancel_event = asyncio.Event()
             self.current_cancel_event = cancel_event
+            self.current_action = "rewrite"
             self.current_task = asyncio.create_task(
                 self.run_generation(payload, cancel_event)
             )
@@ -119,8 +138,16 @@ class GenerationTaskManager:
 
         cancel_event = asyncio.Event()
         self.current_cancel_event = cancel_event
+        self.current_action = "autocomplete"
         self.current_task = asyncio.create_task(
             self.run_generation(payload, cancel_event)
+        )
+
+    def is_rewrite_active(self) -> bool:
+        return (
+            self.current_action == "rewrite"
+            and self.current_task is not None
+            and not self.current_task.done()
         )
 
     async def apply_edit(self, payload: EditorPayload) -> Any:
@@ -145,13 +172,19 @@ class GenerationTaskManager:
                 edit_char_index,
             )
 
-    async def cancel_active_generation(self) -> None:
+    async def cancel_active_generation(self, reason: str = "unspecified") -> None:
         task = self.current_task
         if task is None or task.done():
             self.current_task = None
             self.current_cancel_event = None
+            self.current_action = None
             return
 
+        print(
+            "Cancelling active generation: "
+            f"action={self.current_action} reason={reason}",
+            flush=True,
+        )
         if self.current_cancel_event is not None:
             self.current_cancel_event.set()
         task.cancel()
@@ -163,6 +196,7 @@ class GenerationTaskManager:
         finally:
             self.current_task = None
             self.current_cancel_event = None
+            self.current_action = None
 
     async def run_generation(
         self,
@@ -222,6 +256,7 @@ class GenerationTaskManager:
             if self.current_task is asyncio.current_task():
                 self.current_task = None
                 self.current_cancel_event = None
+                self.current_action = None
 
     async def create_token_iterator(
         self,
@@ -333,7 +368,7 @@ async def editor_websocket(websocket: WebSocket) -> None:
                 )
                 break
     except WebSocketDisconnect:
-        await generation_manager.cancel_active_generation()
+        await generation_manager.cancel_active_generation(reason="websocket_disconnect")
 
 
 if __name__ == '__main__':
