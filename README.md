@@ -339,7 +339,7 @@ if torch.cuda.is_available():
 PY
 ```
 
-For an RTX 4090, CUDA should be visible and the device name should include `4090`.
+For an RTX 3090/4090, CUDA should be visible and the device name should include the GPU model.
 
 ### Check ExLlamaV2 import
 
@@ -357,18 +357,51 @@ PY
 
 If this fails, install a wheel that matches your Python, PyTorch, and CUDA stack. ExLlamaV2 wheels are sensitive to those versions.
 
+### Check Flash Attention for speculative rewrite
+
+ExLlamaV2's dynamic/speculative generator requires paged attention. Install Flash Attention 2.5.7+ in the same venv and verify paged attention support:
+
+```bash
+source venv/bin/activate
+pip install -U packaging ninja
+pip install "flash-attn>=2.5.7" --no-build-isolation
+
+python - <<'PY'
+import flash_attn
+from exllamav2 import attn
+
+print("flash_attn:", flash_attn.__version__)
+print("paged attention available:", attn.has_flash_attn_with_paged)
+PY
+```
+
+Expected:
+
+```text
+paged attention available: True
+```
+
+If installation is slow or fails, use a prebuilt wheel matching your Python, PyTorch, and CUDA versions.
+
 ### Recommended stack notes
 
-- GPU: NVIDIA RTX 4090
+- GPU: NVIDIA RTX 3090 or RTX 4090
 - Python: 3.10 or 3.11 is usually safest for CUDA inference packages
 - PyTorch: install a CUDA build, not CPU-only PyTorch
 - CUDA: match PyTorch and ExLlamaV2 wheel expectations
+- Known working baseline from a Vast.ai/Salad-style RTX 3090 instance:
+  - PyTorch: `2.5.1+cu121`
+  - Torch CUDA: `12.1`
+  - GPU: `NVIDIA GeForce RTX 3090`
+  - `torch.cuda.is_available()`: `True`
+- Flash Attention: `2.5.7+` is required for ExLlamaV2 dynamic/speculative rewrite
 - Model: use a base Qwen2.5-Coder EXL2 quant for Phase 5 autocomplete
 
 ### Common symptoms
 
 - `torch.cuda.is_available() == False`: wrong PyTorch build, missing driver, or container does not expose the GPU.
 - ExLlamaV2 import/build errors: Python/PyTorch/CUDA wheel mismatch.
+- `Paged attention required Flash Attention 2.5.7 or later`: install or upgrade `flash-attn` inside the active venv.
 - `KeyError: 'cuda:0'`: cache/model split or device registration issue; verify model loading and ExLlamaV2 version.
 - Repeated nonsense tokens: test the same FIM prompt through TabbyAPI; if Tabby also fails, suspect model/quant/settings.
 - `Assistant:` or `Dear user` in output: you are probably using an instruct/chat model or a chat prompt path, not FIM with a base Coder model.

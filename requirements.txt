@@ -4,3 +4,9 @@ pydantic==2.6.1
 websockets==13.0
 pytest==7.4.4
 python-dotenv
+wheel
+setuptools
+packaging
+ninja
+psutil
+flash-attn>=2.5.7
