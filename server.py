@@ -313,7 +313,11 @@ class GenerationTaskManager:
                 payload.text,
                 payload.prompt,
                 cancel_event,
-                DEFAULT_REWRITE_MAX_NEW_TOKENS,
+                getattr(
+                    self.manager.engine,
+                    "rewrite_max_new_tokens",
+                    DEFAULT_REWRITE_MAX_NEW_TOKENS,
+                ),
             )
 
         return await asyncio.to_thread(

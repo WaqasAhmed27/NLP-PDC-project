@@ -29,6 +29,7 @@ DEFAULT_REWRITE_TOP_K = 40
 DEFAULT_REWRITE_REPETITION_PENALTY = 1.05
 DEFAULT_REWRITE_MAX_NEW_TOKENS = 128
 DEFAULT_SPECULATIVE_DRAFT_TOKENS = 1
+DEFAULT_ENABLE_SPECULATIVE_REWRITE = True
 FIM_PREFIX = "<|fim_prefix|>"
 FIM_SUFFIX = "<|fim_suffix|>"
 FIM_MIDDLE = "<|fim_middle|>"
@@ -57,6 +58,13 @@ LLAMA3_STOP_TOKEN_IDS = (
 
 def _env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in TRUTHY_ENV_VALUES
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    return raw_value.strip().lower() in TRUTHY_ENV_VALUES
 
 
 def _env_float(name: str, default: float) -> float:
@@ -240,6 +248,7 @@ class MockExLlamaEngine:
         self.prefill_history: list[list[int]] = []
         self.truncation_history: list[int] = []
         self.requires_full_prefill = False
+        self.rewrite_max_new_tokens = DEFAULT_REWRITE_MAX_NEW_TOKENS
 
     def reset(self) -> None:
         with self.gpu_lock:
@@ -318,7 +327,7 @@ class RealExLlamaEngine:
         self,
         qwen_model_dir: str,
         llama_target_model_dir: str,
-        llama_draft_model_dir: str,
+        llama_draft_model_dir: str | None,
         max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> None:
@@ -329,6 +338,14 @@ class RealExLlamaEngine:
         self._qwen_last_token_id: Optional[int] = None
         self._qwen_next_logits: Optional[Any] = None
         self.requires_full_prefill = False
+        self.enable_speculative_rewrite = _env_bool(
+            "ENABLE_SPECULATIVE_REWRITE",
+            DEFAULT_ENABLE_SPECULATIVE_REWRITE,
+        )
+        self.rewrite_max_new_tokens = max(
+            1,
+            _env_int("REWRITE_MAX_NEW_TOKENS", DEFAULT_REWRITE_MAX_NEW_TOKENS),
+        )
         self.speculative_draft_tokens = _env_int(
             "SPECULATIVE_DRAFT_TOKENS",
             DEFAULT_SPECULATIVE_DRAFT_TOKENS,
@@ -416,13 +433,20 @@ class RealExLlamaEngine:
             cache_cls=self.qwen_cache_cls,
             cache_name="8-bit Qwen autocomplete",
         )
-        self.llama_draft = self._load_model_bundle(
-            "LLAMA_REWRITE_DRAFT_MODEL_DIR",
-            llama_draft_model_dir,
-            load_tokenizer=False,
-            cache_cls=self.rewrite_cache_cls,
-            cache_name="Q4 rewrite draft",
-        )
+        self.llama_draft: ModelBundle | None = None
+        if self.enable_speculative_rewrite:
+            if not llama_draft_model_dir:
+                raise RuntimeError(
+                    "LLAMA_REWRITE_DRAFT_MODEL_DIR is required when "
+                    "ENABLE_SPECULATIVE_REWRITE is true"
+                )
+            self.llama_draft = self._load_model_bundle(
+                "LLAMA_REWRITE_DRAFT_MODEL_DIR",
+                llama_draft_model_dir,
+                load_tokenizer=False,
+                cache_cls=self.rewrite_cache_cls,
+                cache_name="Q4 rewrite draft",
+            )
 
         self.qwen_generator = self.streaming_generator_cls(
             self.qwen.model,
@@ -436,15 +460,23 @@ class RealExLlamaEngine:
             self.qwen_repetition_penalty,
         )
 
-        self.rewrite_generator = self.dynamic_generator_cls(
-            model=self.llama_target.model,
-            cache=self.llama_target.cache,
-            tokenizer=self.llama_target.tokenizer,
-            max_seq_len=max_seq_len,
-            draft_model=self.llama_draft.model,
-            draft_cache=self.llama_draft.cache,
-            num_draft_tokens=self.speculative_draft_tokens,
-        )
+        if self.enable_speculative_rewrite:
+            assert self.llama_draft is not None
+            self.rewrite_generator = self.dynamic_generator_cls(
+                model=self.llama_target.model,
+                cache=self.llama_target.cache,
+                tokenizer=self.llama_target.tokenizer,
+                max_seq_len=max_seq_len,
+                draft_model=self.llama_draft.model,
+                draft_cache=self.llama_draft.cache,
+                num_draft_tokens=self.speculative_draft_tokens,
+            )
+        else:
+            self.rewrite_generator = self.streaming_generator_cls(
+                self.llama_target.model,
+                self.llama_target.cache,
+                self.llama_target.tokenizer,
+            )
         self.rewrite_sampling_settings = self._build_sampling_settings(
             self.rewrite_temperature,
             self.rewrite_top_p,
@@ -628,8 +660,9 @@ class RealExLlamaEngine:
         text: str,
         instruction: str,
         cancel_event: Any,
-        max_new_tokens: int = 512,
+        max_new_tokens: int | None = None,
     ) -> Iterator[str]:
+        max_new_tokens = max_new_tokens or self.rewrite_max_new_tokens
         telemetry = TelemetryStats("HEAVY-PATH", time.perf_counter())
         prompt = build_llama_rewrite_prompt(text, instruction)
         input_ids = self._encode_prompt(self.llama_target.tokenizer, prompt)
@@ -638,6 +671,18 @@ class RealExLlamaEngine:
             return
         input_tensor = self.torch.tensor([input_ids], dtype=self.torch.long)
 
+        if not self.enable_speculative_rewrite:
+            try:
+                yield from self._consume_target_rewrite_stream(
+                    input_tensor,
+                    cancel_event,
+                    telemetry,
+                    max_new_tokens,
+                )
+            finally:
+                telemetry.log()
+            return
+
         job = self._build_rewrite_job(input_tensor, max_new_tokens)
 
         try:
@@ -645,6 +690,46 @@ class RealExLlamaEngine:
         finally:
             telemetry.observe_speculative_job(job)
             telemetry.log()
+
+    def _consume_target_rewrite_stream(
+        self,
+        input_tensor: Any,
+        cancel_event: Any,
+        telemetry: TelemetryStats,
+        max_new_tokens: int,
+    ) -> Iterator[str]:
+        with self.gpu_lock, self.torch.inference_mode():
+            self.rewrite_generator.set_stop_conditions(self._rewrite_stop_conditions())
+            self.rewrite_generator.begin_stream_ex(
+                input_tensor,
+                self.rewrite_sampling_settings,
+                token_healing=False,
+            )
+
+        for _ in range(max_new_tokens):
+            if cancel_event.is_set():
+                self._log_rewrite_stop("cancelled")
+                break
+
+            with self.gpu_lock, self.torch.inference_mode():
+                result = self.rewrite_generator.stream_ex()
+
+            chunk = str(result.get("chunk") or result.get("text") or "")
+            if chunk:
+                trimmed_chunk, stop_string = self._trim_at_rewrite_stop(chunk)
+                if trimmed_chunk:
+                    telemetry.observe_chunk(
+                        trimmed_chunk,
+                        self._result_token_count(result),
+                    )
+                    yield trimmed_chunk
+                if stop_string:
+                    self._log_rewrite_stop(f"text stop {stop_string!r}", result)
+                    return
+
+            if result.get("eos", False):
+                self._log_rewrite_stop("eos", result)
+                return
 
     def _build_rewrite_job(self, input_tensor: Any, max_new_tokens: int) -> Any:
         job_candidates = (
@@ -984,6 +1069,10 @@ def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:
     if _env_truthy("USE_MOCK_ENGINE"):
         return MockExLlamaEngine()
 
+    enable_speculative_rewrite = _env_bool(
+        "ENABLE_SPECULATIVE_REWRITE",
+        DEFAULT_ENABLE_SPECULATIVE_REWRITE,
+    )
     qwen_model_dir = os.getenv("QWEN_AUTOCOMPLETE_MODEL_DIR") or os.getenv(
         "EXLLAMA_MODEL_DIR"
     )
@@ -995,7 +1084,7 @@ def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:
         missing_env_vars.append("QWEN_AUTOCOMPLETE_MODEL_DIR")
     if not llama_target_model_dir:
         missing_env_vars.append("LLAMA_REWRITE_TARGET_MODEL_DIR")
-    if not llama_draft_model_dir:
+    if enable_speculative_rewrite and not llama_draft_model_dir:
         missing_env_vars.append("LLAMA_REWRITE_DRAFT_MODEL_DIR")
 
     if missing_env_vars:

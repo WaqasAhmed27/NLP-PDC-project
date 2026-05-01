@@ -390,6 +390,9 @@ If installation is slow or fails, use a prebuilt wheel matching your Python, PyT
 - Speculative rewrite uses the synchronous dynamic job queue: `ExLlamaV2DynamicJob`, `generator.enqueue(job)`, and `generator.iterate()`.
 - Draft acceptance is read from `ExLlamaV2DynamicJob.accepted_draft_tokens` and `rejected_draft_tokens`.
 - Rewrite defaults to `SPECULATIVE_DRAFT_TOKENS=1`; larger draft windows were faster but caused missing words with the current 1B draft model.
+- `REWRITE_MAX_NEW_TOKENS` controls the heavy rewrite output cap; the default is `128`.
+- Set `ENABLE_SPECULATIVE_REWRITE=false` to disable the 1B draft model and run target-only Llama 3.1 8B rewrite. In this mode `LLAMA_REWRITE_DRAFT_MODEL_DIR` is not required.
+- Use target-only mode as the A/B test: if target-only output fixes missing words or garbled phrasing, the speculative draft path is the culprit; if target-only output is still poor, investigate the 8B model, prompt, quant, or sampling settings.
 - If startup fails with `Dynamic generator does not currently work with 8-bit cache`, make sure the code is using the rewrite Q4 cache path and restart the backend.
 
 ### Recommended stack notes
