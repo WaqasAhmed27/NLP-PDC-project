@@ -411,6 +411,7 @@ If installation is slow or fails, use a prebuilt wheel matching your Python, PyT
 - `Paged attention required Flash Attention 2.5.7 or later`: install or upgrade `flash-attn` inside the active venv.
 - `Dynamic generator does not currently work with 8-bit cache`: rewrite target/draft must use Q4 or FP16 cache; the current backend uses Q4 for rewrite.
 - `ExLlamaV2DynamicJobAsync object has no attribute prepare_for_queue`: use the synchronous dynamic job queue path; async jobs can be incompatible with the installed ExLlamaV2 release.
+- Fast path only emits `"\n"` and stops: disable token healing for FIM autocomplete so `<|fim_middle|>` remains intact.
 - `KeyError: 'cuda:0'`: cache/model split or device registration issue; verify model loading and ExLlamaV2 version.
 - Repeated nonsense tokens: test the same FIM prompt through TabbyAPI; if Tabby also fails, suspect model/quant/settings.
 - `Assistant:` or `Dear user` in output: you are probably using an instruct/chat model or a chat prompt path, not FIM with a base Coder model.

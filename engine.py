@@ -555,7 +555,10 @@ class RealExLlamaEngine:
                 self.qwen_generator.begin_stream_ex(
                     input_ids,
                     self.qwen_sampling_settings,
-                    token_healing=True,
+                    # FIM prompts must end on the literal <|fim_middle|> token.
+                    # Token healing can rewrite that boundary token and make Qwen
+                    # continue with newline/EOS instead of filling the middle.
+                    token_healing=False,
                 )
                 self.current_seq_len = self.qwen.cache.current_seq_len
                 self._qwen_last_token_id = int(prompt_token_ids[-1])
