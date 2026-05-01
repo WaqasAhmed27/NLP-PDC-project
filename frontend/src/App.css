@@ -44,6 +44,33 @@
   text-align: center;
 }
 
+.feature-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.feature-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid #d6d9e6;
+  border-radius: 8px;
+  color: #323645;
+  background: #ffffff;
+  font: 700 13px/1 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.feature-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: #4f46e5;
+}
+
 .socket-pill-open {
   border-color: #9bd0b5;
   color: #075f38;

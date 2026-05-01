@@ -25,6 +25,7 @@ export type TokenChunkEvent = {
 }
 
 type AutocompletePluginProps = {
+  enabled: boolean
   onUserDismiss?: () => void
   tokenChunk: TokenChunkEvent | null
 }
@@ -154,16 +155,28 @@ function registerKeyboardInterceptors(
 }
 
 export function AutocompletePlugin({
+  enabled,
   onUserDismiss,
   tokenChunk,
 }: AutocompletePluginProps) {
   const [editor] = useLexicalComposerContext()
 
   useEffect(() => {
+    if (!enabled) {
+      editor.update(() => {
+        $removeAutocompleteNode()
+      })
+      return
+    }
+
     return registerKeyboardInterceptors(editor, onUserDismiss)
-  }, [editor, onUserDismiss])
+  }, [editor, enabled, onUserDismiss])
 
   useEffect(() => {
+    if (!enabled) {
+      return
+    }
+
     const acceptTab = (event: KeyboardEvent) => {
       if (event.key !== 'Tab') {
         return
@@ -196,9 +209,13 @@ export function AutocompletePlugin({
       editor.getRootElement()?.removeEventListener('keydown', acceptTab, true)
       document.removeEventListener('keydown', acceptTab, true)
     }
-  }, [editor, onUserDismiss])
+  }, [editor, enabled, onUserDismiss])
 
   useEffect(() => {
+    if (!enabled) {
+      return
+    }
+
     const rootElement = editor.getRootElement()
 
     if (!rootElement) {
@@ -218,17 +235,17 @@ export function AutocompletePlugin({
     return () => {
       rootElement.removeEventListener('pointerdown', handlePointerDown, true)
     }
-  }, [editor, onUserDismiss])
+  }, [editor, enabled, onUserDismiss])
 
   useEffect(() => {
-    if (!tokenChunk) {
+    if (!enabled || !tokenChunk) {
       return
     }
 
     editor.update(() => {
       $insertOrAppendAutocompleteChunk(tokenChunk.chunk)
     })
-  }, [editor, tokenChunk])
+  }, [editor, enabled, tokenChunk])
 
   return null
 }

@@ -14,6 +14,7 @@ import { FloatingToolbarPlugin } from './FloatingToolbarPlugin'
 type PendingEdit = {
   text: string
   cursorCharIndex: number
+  shouldAutocomplete: boolean
 }
 
 const EDIT_DEBOUNCE_MS = 50
@@ -150,6 +151,8 @@ export function Editor() {
   const [tokenChunk, setTokenChunk] = useState<TokenChunkEvent | null>(null)
   const [rewriteChunk, setRewriteChunk] = useState<TokenChunkEvent | null>(null)
   const [rewriteDoneId, setRewriteDoneId] = useState(0)
+  const [isAutocompleteEnabled, setIsAutocompleteEnabled] = useState(true)
+  const [isRewriteEnabled, setIsRewriteEnabled] = useState(true)
 
   const handleSocketMessage = useCallback((payload: IncomingEditorMessage) => {
     setLastMessage(payload)
@@ -210,7 +213,7 @@ export function Editor() {
         window.clearTimeout(autocompleteTimerRef.current)
       }
 
-      if (!text.trim()) {
+      if (!isAutocompleteEnabled || !text.trim()) {
         return
       }
 
@@ -224,7 +227,7 @@ export function Editor() {
         suppressIncomingTokensRef.current = false
       }, AUTOCOMPLETE_DEBOUNCE_MS)
     },
-    [sendMessage],
+    [isAutocompleteEnabled, sendMessage],
   )
 
   const handleGhostDismiss = useCallback(() => {
@@ -249,6 +252,24 @@ export function Editor() {
       return requestId
     },
     [sendRewriteRequest],
+  )
+
+  const handleAutocompleteToggle = useCallback(
+    (enabled: boolean) => {
+      setIsAutocompleteEnabled(enabled)
+
+      if (enabled) {
+        return
+      }
+
+      if (autocompleteTimerRef.current !== null) {
+        window.clearTimeout(autocompleteTimerRef.current)
+        autocompleteTimerRef.current = null
+      }
+
+      handleGhostDismiss()
+    },
+    [handleGhostDismiss],
   )
 
   const flushPendingEdit = useCallback(() => {
@@ -288,7 +309,9 @@ export function Editor() {
         edit_char_index: safeEditCharIndex,
         cursor_char_index: pendingEdit.cursorCharIndex,
       })
-      scheduleAutocomplete(pendingEdit.text, pendingEdit.cursorCharIndex)
+      if (pendingEdit.shouldAutocomplete) {
+        scheduleAutocomplete(pendingEdit.text, pendingEdit.cursorCharIndex)
+      }
     }
   }, [scheduleAutocomplete, sendMessage])
 
@@ -331,6 +354,25 @@ export function Editor() {
         <span className={`socket-pill socket-pill-${status}`}>{status}</span>
       </header>
 
+      <div className="feature-toggles" aria-label="Editor features">
+        <label className="feature-toggle">
+          <input
+            type="checkbox"
+            checked={isAutocompleteEnabled}
+            onChange={(event) => handleAutocompleteToggle(event.target.checked)}
+          />
+          <span>Autocomplete</span>
+        </label>
+        <label className="feature-toggle">
+          <input
+            type="checkbox"
+            checked={isRewriteEnabled}
+            onChange={(event) => setIsRewriteEnabled(event.target.checked)}
+          />
+          <span>Rewrite toolbar</span>
+        </label>
+      </div>
+
       <LexicalComposer initialConfig={initialConfig}>
         <section className="editor-frame">
           <PlainTextPlugin
@@ -348,22 +390,43 @@ export function Editor() {
           />
           <HistoryPlugin />
           <AutocompletePlugin
+            enabled={isAutocompleteEnabled}
             onUserDismiss={handleGhostDismiss}
             tokenChunk={tokenChunk}
           />
-          <FloatingToolbarPlugin
-            onRewriteRequest={handleRewriteRequest}
-            rewriteChunk={rewriteChunk}
-            rewriteDoneId={rewriteDoneId}
-          />
+          {isRewriteEnabled ? (
+            <FloatingToolbarPlugin
+              onRewriteRequest={handleRewriteRequest}
+              rewriteChunk={rewriteChunk}
+              rewriteDoneId={rewriteDoneId}
+            />
+          ) : null}
           <OnChangePlugin
             ignoreSelectionChange={false}
             onChange={(editorState) => {
+              let shouldAutocomplete = false
+              let text = ''
+              let cursorCharIndex = 0
+
               editorState.read(() => {
-                const text = getGhostFreeTextContent($getRoot())
-                const cursorCharIndex = getCursorCharacterIndex()
-                scheduleEdit({ text, cursorCharIndex })
+                const selection = $getSelection()
+                const isCollapsedRange =
+                  $isRangeSelection(selection) && selection.isCollapsed()
+
+                text = getGhostFreeTextContent($getRoot())
+                cursorCharIndex = getCursorCharacterIndex()
+                shouldAutocomplete = isAutocompleteEnabled && isCollapsedRange
               })
+
+              if (!shouldAutocomplete) {
+                if (autocompleteTimerRef.current !== null) {
+                  window.clearTimeout(autocompleteTimerRef.current)
+                  autocompleteTimerRef.current = null
+                }
+                handleGhostDismiss()
+              }
+
+              scheduleEdit({ text, cursorCharIndex, shouldAutocomplete })
             }}
           />
         </section>
