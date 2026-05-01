@@ -2,11 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   $createTextNode,
+  $getNodeByKey,
   $getSelection,
   $isRangeSelection,
+  $isTextNode,
   $setSelection,
-  type BaseSelection,
   type LexicalEditor,
+  type NodeKey,
+  type RangeSelection,
 } from 'lexical'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
 
@@ -68,9 +71,10 @@ export function FloatingToolbarPlugin({
   const [selectedText, setSelectedText] = useState('')
   const [instruction, setInstruction] = useState('Make this sound more professional')
   const [position, setPosition] = useState<ToolbarPosition | null>(null)
-  const [storedSelection, setStoredSelection] = useState<BaseSelection | null>(null)
   const isRewritingRef = useRef(false)
   const rewriteTextRef = useRef('')
+  const storedSelectionRef = useRef<RangeSelection | null>(null)
+  const rewriteNodeKeyRef = useRef<NodeKey | null>(null)
 
   useEffect(() => {
     return editor.registerUpdateListener(({ editorState }) => {
@@ -105,7 +109,23 @@ export function FloatingToolbarPlugin({
   const replaceStoredSelection = useCallback(
     (text: string, selectEnd = false) => {
       editor.update(() => {
-        if (!storedSelection) {
+        const rewriteNodeKey = rewriteNodeKeyRef.current
+
+        if (rewriteNodeKey) {
+          const rewriteNode = $getNodeByKey(rewriteNodeKey)
+
+          if ($isTextNode(rewriteNode)) {
+            rewriteNode.setTextContent(text)
+            if (selectEnd) {
+              rewriteNode.select(text.length, text.length)
+            }
+          }
+          return
+        }
+
+        const storedSelection = storedSelectionRef.current
+
+        if (!storedSelection || !text) {
           return
         }
 
@@ -117,25 +137,21 @@ export function FloatingToolbarPlugin({
         }
 
         selection.removeText()
-
-        if (!text) {
-          return
-        }
-
         const textNode = $createTextNode(text)
         selection.insertNodes([textNode])
+        rewriteNodeKeyRef.current = textNode.getKey()
 
         if (selectEnd) {
           textNode.select(text.length, text.length)
         }
       })
     },
-    [editor, storedSelection],
+    [editor],
   )
 
   const handleRewrite = useCallback(() => {
     let highlightedText = ''
-    let clonedSelection: BaseSelection | null = null
+    let clonedSelection: RangeSelection | null = null
 
     editor.getEditorState().read(() => {
       const selection = $getSelection()
@@ -156,7 +172,8 @@ export function FloatingToolbarPlugin({
       return
     }
 
-    setStoredSelection(clonedSelection)
+    storedSelectionRef.current = clonedSelection
+    rewriteNodeKeyRef.current = null
     rewriteTextRef.current = ''
     isRewritingRef.current = true
     setPosition(null)
@@ -167,18 +184,19 @@ export function FloatingToolbarPlugin({
     setPosition(null)
     isRewritingRef.current = false
     rewriteTextRef.current = ''
-    setStoredSelection(null)
+    storedSelectionRef.current = null
+    rewriteNodeKeyRef.current = null
     clearEditorSelection(editor)
   }, [editor])
 
   useEffect(() => {
-    if (!rewriteChunk || !storedSelection) {
+    if (!rewriteChunk || !isRewritingRef.current) {
       return
     }
 
     rewriteTextRef.current += rewriteChunk.chunk
     replaceStoredSelection(rewriteTextRef.current)
-  }, [replaceStoredSelection, rewriteChunk, storedSelection])
+  }, [replaceStoredSelection, rewriteChunk])
 
   useEffect(() => {
     if (!isRewritingRef.current || rewriteDoneId === 0) {
@@ -188,7 +206,8 @@ export function FloatingToolbarPlugin({
     replaceStoredSelection(rewriteTextRef.current, true)
     isRewritingRef.current = false
     rewriteTextRef.current = ''
-    setStoredSelection(null)
+    storedSelectionRef.current = null
+    rewriteNodeKeyRef.current = null
   }, [replaceStoredSelection, rewriteDoneId])
 
   if (!position || !selectedText) {
