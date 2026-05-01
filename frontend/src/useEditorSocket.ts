@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-type EditorAction = 'edit' | 'autocomplete' | 'rewrite'
 type StreamPayloadType = 'token' | 'done' | 'cancelled' | 'server_error'
 
 type OutgoingEditorMessage = {
-  action: EditorAction
+  action: 'edit' | 'autocomplete'
   newText: string
   editCharIndex: number
+}
+
+type OutgoingRewriteMessage = {
+  highlightedText: string
+  instruction: string
 }
 
 export type IncomingEditorMessage = {
@@ -18,9 +22,16 @@ export type IncomingEditorMessage = {
 
 type WireEditorPayload = {
   request_id: string
-  action: EditorAction
+  action: 'edit' | 'autocomplete'
   new_text: string
   edit_char_index: number
+}
+
+type WireRewritePayload = {
+  request_id: string
+  action: 'rewrite'
+  text: string
+  prompt: string
 }
 
 type UseEditorSocketOptions = {
@@ -155,5 +166,25 @@ export function useEditorSocket({
     return true
   }, [])
 
-  return { status, sendMessage }
+  const sendRewriteRequest = useCallback((message: OutgoingRewriteMessage) => {
+    const socket = socketRef.current
+
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return null
+    }
+
+    const requestId = createRequestId()
+    const payload: WireRewritePayload = {
+      request_id: requestId,
+      action: 'rewrite',
+      text: message.highlightedText,
+      prompt: message.instruction,
+    }
+
+    socket.send(JSON.stringify(payload))
+    console.info('editor socket sent rewrite', payload)
+    return requestId
+  }, [])
+
+  return { status, sendMessage, sendRewriteRequest }
 }

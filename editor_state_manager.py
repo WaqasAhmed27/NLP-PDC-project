@@ -53,6 +53,7 @@ DEFAULT_MODEL_ID: str = "Qwen/Qwen2.5-1.5B-Instruct"
 def _default_tokenizer_model_id() -> str:
     return (
         os.getenv("EDITOR_TOKENIZER_MODEL")
+        or os.getenv("QWEN_AUTOCOMPLETE_MODEL_DIR")
         or os.getenv("EXLLAMA_TOKENIZER_MODEL")
         or os.getenv("EXLLAMA_MODEL_DIR")
         or DEFAULT_MODEL_ID

@@ -14,7 +14,7 @@ from typing import Any, Iterator, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Extra, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 load_dotenv()
 
@@ -23,23 +23,35 @@ from editor_state_manager import EditorStateManager
 
 
 class EditorPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     request_id: str
     action: Literal["edit", "autocomplete", "rewrite"]
-    new_text: str
-    edit_char_index: int
+    new_text: Optional[str] = None
+    edit_char_index: Optional[int] = None
+    text: Optional[str] = None
+    prompt: Optional[str] = None
 
-    class Config:
-        extra = Extra.forbid
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> "EditorPayload":
+        if self.action in {"edit", "autocomplete"}:
+            if self.new_text is None or self.edit_char_index is None:
+                raise ValueError(
+                    "edit/autocomplete payloads require new_text and edit_char_index"
+                )
+        if self.action == "rewrite":
+            if self.text is None or self.prompt is None:
+                raise ValueError("rewrite payloads require text and prompt")
+        return self
 
 
 class StreamPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     request_id: str
     type: Literal["token", "done", "cancelled", "server_error"]
     chunk: str
     latency_ms: int
-
-    class Config:
-        extra = Extra.forbid
 
 
 app = FastAPI(title="Phase 3 Editor WebSocket Server")
@@ -77,6 +89,14 @@ class GenerationTaskManager:
         await self.cancel_active_generation()
         started_at = time.perf_counter()
 
+        if payload.action == "rewrite":
+            cancel_event = asyncio.Event()
+            self.current_cancel_event = cancel_event
+            self.current_task = asyncio.create_task(
+                self.run_generation(payload, cancel_event)
+            )
+            return
+
         try:
             edit_result = await self.apply_edit(payload)
         except Exception as exc:
@@ -105,6 +125,8 @@ class GenerationTaskManager:
 
     async def apply_edit(self, payload: EditorPayload) -> Any:
         async with self.state_lock:
+            assert payload.new_text is not None
+            assert payload.edit_char_index is not None
             edit_char_index = payload.edit_char_index
             if getattr(self.manager.engine, "requires_full_prefill", False):
                 edit_char_index = 0
@@ -152,27 +174,7 @@ class GenerationTaskManager:
         failed = False
 
         try:
-            max_new_tokens = 24 if payload.action == "autocomplete" else 80
-            if payload.action == "autocomplete" and hasattr(
-                self.manager.engine,
-                "generate_autocomplete_stream",
-            ):
-                token_iterator = await asyncio.to_thread(
-                    self.manager.engine.generate_autocomplete_stream,
-                    self.manager.current_text,
-                    min(
-                        max(payload.edit_char_index, 0),
-                        len(self.manager.current_text),
-                    ),
-                    cancel_event,
-                    max_new_tokens,
-                )
-            else:
-                token_iterator = await asyncio.to_thread(
-                    self.manager.engine.generate_stream,
-                    cancel_event,
-                    max_new_tokens,
-                )
+            token_iterator = await self.create_token_iterator(payload, cancel_event)
             while not cancel_event.is_set():
                 token = await asyncio.to_thread(_next_token, token_iterator)
                 if token is None:
@@ -221,6 +223,50 @@ class GenerationTaskManager:
                 self.current_task = None
                 self.current_cancel_event = None
 
+    async def create_token_iterator(
+        self,
+        payload: EditorPayload,
+        cancel_event: asyncio.Event,
+    ) -> Iterator[str]:
+        if payload.action == "autocomplete":
+            assert payload.edit_char_index is not None
+            if payload.action == "autocomplete" and hasattr(
+                self.manager.engine,
+                "generate_autocomplete_stream",
+            ):
+                return await asyncio.to_thread(
+                    self.manager.engine.generate_autocomplete_stream,
+                    self.manager.current_text,
+                    min(
+                        max(payload.edit_char_index, 0),
+                        len(self.manager.current_text),
+                    ),
+                    cancel_event,
+                    24,
+                )
+            return await asyncio.to_thread(
+                self.manager.engine.generate_stream,
+                cancel_event,
+                24,
+            )
+
+        if payload.action == "rewrite":
+            assert payload.text is not None
+            assert payload.prompt is not None
+            return await asyncio.to_thread(
+                self.manager.engine.apply_rewrite,
+                payload.text,
+                payload.prompt,
+                cancel_event,
+                512,
+            )
+
+        return await asyncio.to_thread(
+            self.manager.engine.generate_stream,
+            cancel_event,
+            80,
+        )
+
     async def send_stream_payload(
         self,
         *,
@@ -236,7 +282,7 @@ class GenerationTaskManager:
             latency_ms=int((time.perf_counter() - started_at) * 1000),
         )
         async with self.send_lock:
-            await self.websocket.send_json(payload.dict())
+            await self.websocket.send_json(payload.model_dump())
 
     async def safe_send_stream_payload(self, **kwargs: Any) -> bool:
         """Send payload, returning False if the WebSocket is no longer usable."""

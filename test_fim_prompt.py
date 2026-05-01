@@ -1,4 +1,4 @@
-from engine import build_qwen_fim_prompt
+from engine import build_llama_rewrite_prompt, build_qwen_fim_prompt
 
 
 def test_fim_prompt_cursor_at_end() -> None:
@@ -42,3 +42,21 @@ def test_fim_prompt_clamps_out_of_range_cursor() -> None:
         build_qwen_fim_prompt("abc", -5)
         == "<|fim_prefix|><|fim_suffix|>abc<|fim_middle|>"
     )
+
+
+def test_llama_rewrite_prompt_uses_llama_chat_template() -> None:
+    prompt = build_llama_rewrite_prompt(
+        "this is too casual",
+        "Make this more professional",
+    )
+
+    assert "<|begin_of_text|>" in prompt
+    assert "<|start_header_id|>system<|end_header_id|>" in prompt
+    assert "<|start_header_id|>user<|end_header_id|>" in prompt
+    assert "<|start_header_id|>assistant<|end_header_id|>" in prompt
+    assert "Make this more professional" in prompt
+    assert "this is too casual" in prompt
+    assert "<|eot_id|>" in prompt
+    assert "<|fim_prefix|>" not in prompt
+    assert "<|fim_suffix|>" not in prompt
+    assert "<|fim_middle|>" not in prompt

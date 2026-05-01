@@ -9,6 +9,7 @@ import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary'
 import { useEditorSocket, type IncomingEditorMessage } from './useEditorSocket'
 import { AutocompleteNode, $isAutocompleteNode } from './AutocompleteNode'
 import { AutocompletePlugin, type TokenChunkEvent } from './AutocompletePlugin'
+import { FloatingToolbarPlugin } from './FloatingToolbarPlugin'
 
 type PendingEdit = {
   text: string
@@ -141,12 +142,40 @@ export function Editor() {
   const lastSentTextRef = useRef('')
   const lastSentCursorRef = useRef(0)
   const suppressIncomingTokensRef = useRef(false)
+  const activeRewriteRequestIdRef = useRef<string | null>(null)
   const tokenChunkIdRef = useRef(0)
+  const rewriteChunkIdRef = useRef(0)
+  const rewriteDoneIdRef = useRef(0)
   const [lastMessage, setLastMessage] = useState<IncomingEditorMessage | null>(null)
   const [tokenChunk, setTokenChunk] = useState<TokenChunkEvent | null>(null)
+  const [rewriteChunk, setRewriteChunk] = useState<TokenChunkEvent | null>(null)
+  const [rewriteDoneId, setRewriteDoneId] = useState(0)
 
   const handleSocketMessage = useCallback((payload: IncomingEditorMessage) => {
     setLastMessage(payload)
+
+    if (payload.request_id === activeRewriteRequestIdRef.current) {
+      if (payload.type === 'token' && payload.chunk) {
+        rewriteChunkIdRef.current += 1
+        setRewriteChunk({
+          id: rewriteChunkIdRef.current,
+          chunk: payload.chunk,
+        })
+      }
+
+      if (
+        payload.type === 'done' ||
+        payload.type === 'cancelled' ||
+        payload.type === 'server_error'
+      ) {
+        rewriteDoneIdRef.current += 1
+        setRewriteDoneId(rewriteDoneIdRef.current)
+        activeRewriteRequestIdRef.current = null
+      }
+
+      console.info('editor socket rewrite message', payload)
+      return
+    }
 
     if (payload.type === 'token' && payload.chunk && !suppressIncomingTokensRef.current) {
       tokenChunkIdRef.current += 1
@@ -159,7 +188,7 @@ export function Editor() {
     console.info('editor socket message', payload)
   }, [])
 
-  const { status, sendMessage } = useEditorSocket({
+  const { status, sendMessage, sendRewriteRequest } = useEditorSocket({
     onMessage: handleSocketMessage,
   })
 
@@ -202,6 +231,25 @@ export function Editor() {
     suppressIncomingTokensRef.current = true
     setTokenChunk(null)
   }, [])
+
+  const handleRewriteRequest = useCallback(
+    (highlightedText: string, instruction: string) => {
+      const requestId = sendRewriteRequest({
+        highlightedText,
+        instruction,
+      })
+
+      if (requestId) {
+        activeRewriteRequestIdRef.current = requestId
+        suppressIncomingTokensRef.current = true
+        setTokenChunk(null)
+        setRewriteChunk(null)
+      }
+
+      return requestId
+    },
+    [sendRewriteRequest],
+  )
 
   const flushPendingEdit = useCallback(() => {
     const pendingEdit = pendingEditRef.current
@@ -302,6 +350,11 @@ export function Editor() {
           <AutocompletePlugin
             onUserDismiss={handleGhostDismiss}
             tokenChunk={tokenChunk}
+          />
+          <FloatingToolbarPlugin
+            onRewriteRequest={handleRewriteRequest}
+            rewriteChunk={rewriteChunk}
+            rewriteDoneId={rewriteDoneId}
           />
           <OnChangePlugin
             ignoreSelectionChange={false}
