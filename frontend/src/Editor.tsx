@@ -282,12 +282,15 @@ export function Editor() {
         return
       }
 
-      if (payload.request_id !== latestCorrectionRequestIdRef.current) {
-        return
-      }
-
       try {
         const parsed = JSON.parse(payload.chunk) as Omit<CorrectionSuggestion, 'id'>[]
+        if (payload.request_id !== latestCorrectionRequestIdRef.current) {
+          console.info('accepting out-of-order corrections payload', {
+            request_id: payload.request_id,
+            latest_correction_request_id: latestCorrectionRequestIdRef.current,
+            count: parsed.length,
+          })
+        }
         setCorrectionSuggestions(
           parsed.map((suggestion, index) => ({
             ...suggestion,

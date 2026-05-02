@@ -5,6 +5,7 @@ import {
   $getSelection,
   $isElementNode,
   $isRangeSelection,
+  $isTextNode,
   CLICK_COMMAND,
   COMMAND_PRIORITY_HIGH,
   KEY_DOWN_COMMAND,
@@ -84,7 +85,10 @@ function $insertOrAppendAutocompleteChunk(chunk: string) {
 
   if ($isRangeSelection(selection)) {
     selection.insertNodes([autocompleteNode])
-    autocompleteNode.selectPrevious()
+    const previousSibling = autocompleteNode.getPreviousSibling()
+    if (previousSibling && $isTextNode(previousSibling)) {
+      previousSibling.selectEnd()
+    }
   }
 }
 
