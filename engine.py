@@ -342,6 +342,10 @@ class RealExLlamaEngine:
             "ENABLE_SPECULATIVE_REWRITE",
             DEFAULT_ENABLE_SPECULATIVE_REWRITE,
         )
+        self.debug_speculative_rewrite = _env_bool(
+            "DEBUG_SPECULATIVE_REWRITE",
+            False,
+        )
         self.rewrite_max_new_tokens = max(
             1,
             _env_int("REWRITE_MAX_NEW_TOKENS", DEFAULT_REWRITE_MAX_NEW_TOKENS),
@@ -686,7 +690,12 @@ class RealExLlamaEngine:
         job = self._build_rewrite_job(input_tensor, max_new_tokens)
 
         try:
-            yield from self._consume_dynamic_job(job, cancel_event, telemetry)
+            yield from self._consume_dynamic_job(
+                job,
+                cancel_event,
+                telemetry,
+                max_new_tokens,
+            )
         finally:
             telemetry.observe_speculative_job(job)
             telemetry.log()
@@ -766,16 +775,21 @@ class RealExLlamaEngine:
         job: Any,
         cancel_event: Any,
         telemetry: TelemetryStats,
+        max_new_tokens: int,
     ) -> Iterator[str]:
         with self.gpu_lock, self.torch.inference_mode():
             self.rewrite_generator.enqueue(job)
 
+        emitted_tokens = 0
         try:
             while not cancel_event.is_set():
                 with self.gpu_lock, self.torch.inference_mode():
                     results = self.rewrite_generator.iterate()
 
                 if not results:
+                    if self._job_is_complete(job):
+                        self._log_rewrite_stop("generator completion without eos")
+                        return
                     continue
 
                 for result in results:
@@ -784,7 +798,8 @@ class RealExLlamaEngine:
                         continue
 
                     telemetry.observe_speculative_result(result)
-                    chunk = str(result.get("text") or result.get("chunk") or "")
+                    token_count = self._result_token_count(result)
+                    chunk = self._dynamic_result_chunk(result)
                     if not chunk:
                         if result.get("eos", False):
                             self._log_rewrite_stop("eos", result)
@@ -793,10 +808,8 @@ class RealExLlamaEngine:
 
                     trimmed_chunk, stop_string = self._trim_at_rewrite_stop(chunk)
                     if trimmed_chunk:
-                        telemetry.observe_chunk(
-                            trimmed_chunk,
-                            self._result_token_count(result),
-                        )
+                        telemetry.observe_chunk(trimmed_chunk, token_count)
+                        emitted_tokens += token_count
                         yield trimmed_chunk
                     if stop_string:
                         self._log_rewrite_stop(f"text stop {stop_string!r}", result)
@@ -804,10 +817,39 @@ class RealExLlamaEngine:
                     if result.get("eos", False):
                         self._log_rewrite_stop("eos", result)
                         return
+                    if emitted_tokens >= max_new_tokens:
+                        self._log_rewrite_stop("max_new_tokens", result)
+                        return
         finally:
             if cancel_event.is_set() and hasattr(job, "cancel"):
                 self._log_rewrite_stop("cancelled")
                 job.cancel()
+
+    def _dynamic_result_chunk(self, result: dict[str, Any]) -> str:
+        chunk = result.get("chunk")
+        text = result.get("text")
+        if self.debug_speculative_rewrite:
+            keys = ",".join(sorted(str(key) for key in result.keys()))
+            chunk_preview = repr(str(chunk)[:80]) if chunk is not None else "None"
+            text_preview = repr(str(text)[:80]) if text is not None else "None"
+            print(
+                "[HEAVY-PATH] Dynamic result "
+                f"keys={keys} chunk={chunk_preview} text={text_preview}",
+                flush=True,
+            )
+        return str(chunk if chunk is not None else text or "")
+
+    def _job_is_complete(self, job: Any) -> bool:
+        for attr_name in ("eos", "finished", "done", "completed", "is_complete"):
+            value = getattr(job, attr_name, None)
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    continue
+            if isinstance(value, bool) and value:
+                return True
+        return False
 
     def _trim_at_rewrite_stop(self, chunk: str) -> tuple[str, Optional[str]]:
         stop_index: Optional[int] = None
