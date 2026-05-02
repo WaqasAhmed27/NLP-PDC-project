@@ -1,4 +1,10 @@
-from engine import build_llama_rewrite_prompt, build_qwen_fim_prompt
+from engine import (
+    build_llama_autocomplete_prompt,
+    build_llama_rewrite_prompt,
+    build_qwen_fim_prompt,
+    parse_correction_suggestions,
+    sanitize_autocomplete_completion,
+)
 
 
 def test_fim_prompt_cursor_at_end() -> None:
@@ -63,3 +69,49 @@ def test_llama_rewrite_prompt_uses_llama_chat_template() -> None:
     assert "<|fim_prefix|>" not in prompt
     assert "<|fim_suffix|>" not in prompt
     assert "<|fim_middle|>" not in prompt
+
+
+def test_llama_autocomplete_prompt_uses_prefix_suffix_context() -> None:
+    prompt = build_llama_autocomplete_prompt("Hello brave world", 11)
+
+    assert "Continue the text at the cursor with 1 to 8 words" in prompt
+    assert "Before cursor:\nHello brave" in prompt
+    assert "After cursor:\n world" in prompt
+    assert "<|fim_prefix|>" not in prompt
+    assert "<|fim_suffix|>" not in prompt
+
+
+def test_autocomplete_sanitizer_rejects_code_and_prefaces() -> None:
+    assert sanitize_autocomplete_completion("```python\nprint(1)", "Hello", 5) == ""
+    assert sanitize_autocomplete_completion("Here is the continuation", "Hello", 5) == ""
+    assert sanitize_autocomplete_completion(" gentle useful words for today", "Hello", 5) == (
+        "gentle useful words for today"
+    )
+
+
+def test_autocomplete_sanitizer_limits_phrase_length() -> None:
+    completion = " one two three four five six seven eight nine ten"
+
+    assert sanitize_autocomplete_completion(completion, "Hello", 5) == (
+        "one two three four five six seven eight"
+    )
+
+
+def test_parse_correction_suggestions_validates_and_shifts_offsets() -> None:
+    raw = '[{"start": 4, "end": 7, "replacement": "are", "reason": "grammar"}]'
+
+    assert parse_correction_suggestions(raw, 10, "You is kind") == [
+        {"start": 14, "end": 17, "replacement": "are", "reason": "grammar"}
+    ]
+
+
+def test_parse_correction_suggestions_rejects_malformed_json() -> None:
+    assert parse_correction_suggestions("not json", 0, "You is kind") == []
+    assert (
+        parse_correction_suggestions(
+            '[{"start": 4, "end": 99, "replacement": "are", "reason": "grammar"}]',
+            0,
+            "You is kind",
+        )
+        == []
+    )

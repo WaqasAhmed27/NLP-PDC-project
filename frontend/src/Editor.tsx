@@ -9,16 +9,22 @@ import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary'
 import { useEditorSocket, type IncomingEditorMessage } from './useEditorSocket'
 import { AutocompleteNode, $isAutocompleteNode } from './AutocompleteNode'
 import { AutocompletePlugin, type TokenChunkEvent } from './AutocompletePlugin'
+import {
+  CorrectionSuggestionsPlugin,
+  type CorrectionSuggestion,
+} from './CorrectionSuggestionsPlugin'
 import { FloatingToolbarPlugin } from './FloatingToolbarPlugin'
 
 type PendingEdit = {
   text: string
   cursorCharIndex: number
   shouldAutocomplete: boolean
+  shouldCorrect: boolean
 }
 
 const EDIT_DEBOUNCE_MS = 50
 const AUTOCOMPLETE_DEBOUNCE_MS = 250
+const CORRECTION_DEBOUNCE_MS = 1200
 
 const lexicalTheme = {
   paragraph: 'editor-paragraph',
@@ -139,9 +145,12 @@ function getFirstChangedCharacterIndex(previousText: string, nextText: string) {
 export function Editor() {
   const debounceTimerRef = useRef<number | null>(null)
   const autocompleteTimerRef = useRef<number | null>(null)
+  const correctionTimerRef = useRef<number | null>(null)
   const pendingEditRef = useRef<PendingEdit | null>(null)
   const lastSentTextRef = useRef('')
   const lastSentCursorRef = useRef(0)
+  const lastCorrectionTextRef = useRef('')
+  const latestCorrectionRequestIdRef = useRef<string | null>(null)
   const suppressIncomingTokensRef = useRef(false)
   const suppressEditorSyncRef = useRef(false)
   const activeRewriteRequestIdRef = useRef<string | null>(null)
@@ -152,6 +161,7 @@ export function Editor() {
   const [tokenChunk, setTokenChunk] = useState<TokenChunkEvent | null>(null)
   const [rewriteChunks, setRewriteChunks] = useState<TokenChunkEvent[]>([])
   const [rewriteDoneId, setRewriteDoneId] = useState(0)
+  const [correctionSuggestions, setCorrectionSuggestions] = useState<CorrectionSuggestion[]>([])
   const [isAutocompleteEnabled, setIsAutocompleteEnabled] = useState(true)
   const [isRewriteEnabled, setIsRewriteEnabled] = useState(true)
 
@@ -183,6 +193,25 @@ export function Editor() {
       return
     }
 
+    if (payload.type === 'corrections') {
+      if (payload.request_id !== latestCorrectionRequestIdRef.current) {
+        return
+      }
+
+      try {
+        const parsed = JSON.parse(payload.chunk) as Omit<CorrectionSuggestion, 'id'>[]
+        setCorrectionSuggestions(
+          parsed.map((suggestion, index) => ({
+            ...suggestion,
+            id: `${payload.request_id}-${index}`,
+          })),
+        )
+      } catch (error) {
+        console.error('Failed to parse correction suggestions', error)
+      }
+      return
+    }
+
     if (payload.type === 'token' && payload.chunk && !suppressIncomingTokensRef.current) {
       tokenChunkIdRef.current += 1
       setTokenChunk({
@@ -206,6 +235,10 @@ export function Editor() {
 
       if (autocompleteTimerRef.current !== null) {
         window.clearTimeout(autocompleteTimerRef.current)
+      }
+
+      if (correctionTimerRef.current !== null) {
+        window.clearTimeout(correctionTimerRef.current)
       }
     }
   }, [])
@@ -233,6 +266,32 @@ export function Editor() {
     [isAutocompleteEnabled, sendMessage],
   )
 
+  const scheduleCorrection = useCallback(
+    (text: string, cursorCharIndex: number) => {
+      if (correctionTimerRef.current !== null) {
+        window.clearTimeout(correctionTimerRef.current)
+      }
+
+      if (!text.trim() || text === lastCorrectionTextRef.current) {
+        return
+      }
+
+      correctionTimerRef.current = window.setTimeout(() => {
+        correctionTimerRef.current = null
+        const requestId = sendMessage({
+          action: 'correct',
+          newText: text,
+          editCharIndex: cursorCharIndex,
+        })
+        if (requestId) {
+          latestCorrectionRequestIdRef.current = requestId
+          lastCorrectionTextRef.current = text
+        }
+      }, CORRECTION_DEBOUNCE_MS)
+    },
+    [sendMessage],
+  )
+
   const handleGhostDismiss = useCallback(() => {
     suppressIncomingTokensRef.current = true
     setTokenChunk(null)
@@ -258,8 +317,13 @@ export function Editor() {
           window.clearTimeout(autocompleteTimerRef.current)
           autocompleteTimerRef.current = null
         }
+        if (correctionTimerRef.current !== null) {
+          window.clearTimeout(correctionTimerRef.current)
+          correctionTimerRef.current = null
+        }
         setTokenChunk(null)
         setRewriteChunks([])
+        setCorrectionSuggestions([])
       }
 
       return requestId
@@ -325,12 +389,31 @@ export function Editor() {
       if (pendingEdit.shouldAutocomplete) {
         scheduleAutocomplete(pendingEdit.text, pendingEdit.cursorCharIndex)
       }
+      if (pendingEdit.shouldCorrect) {
+        scheduleCorrection(pendingEdit.text, pendingEdit.cursorCharIndex)
+      }
     }
-  }, [scheduleAutocomplete, sendMessage])
+  }, [scheduleAutocomplete, scheduleCorrection, sendMessage])
+
+  const handleCorrectionAccept = useCallback((suggestionId: string, nextText: string) => {
+    setCorrectionSuggestions((suggestions) =>
+      suggestions.filter((suggestion) => suggestion.id !== suggestionId),
+    )
+    lastCorrectionTextRef.current = nextText
+  }, [])
+
+  const handleCorrectionDismiss = useCallback((suggestionId: string) => {
+    setCorrectionSuggestions((suggestions) =>
+      suggestions.filter((suggestion) => suggestion.id !== suggestionId),
+    )
+  }, [])
 
   const scheduleEdit = useCallback(
     (edit: PendingEdit) => {
       pendingEditRef.current = edit
+      if (edit.text !== lastSentTextRef.current) {
+        setCorrectionSuggestions([])
+      }
 
       if (debounceTimerRef.current !== null) {
         window.clearTimeout(debounceTimerRef.current)
@@ -338,6 +421,10 @@ export function Editor() {
 
       if (autocompleteTimerRef.current !== null) {
         window.clearTimeout(autocompleteTimerRef.current)
+      }
+
+      if (correctionTimerRef.current !== null) {
+        window.clearTimeout(correctionTimerRef.current)
       }
 
       debounceTimerRef.current = window.setTimeout(() => {
@@ -407,6 +494,11 @@ export function Editor() {
             onUserDismiss={handleGhostDismiss}
             tokenChunk={tokenChunk}
           />
+          <CorrectionSuggestionsPlugin
+            suggestions={correctionSuggestions}
+            onAccept={handleCorrectionAccept}
+            onDismiss={handleCorrectionDismiss}
+          />
           {isRewriteEnabled ? (
             <FloatingToolbarPlugin
               onRewriteRequest={handleRewriteRequest}
@@ -431,6 +523,7 @@ export function Editor() {
               }
 
               let shouldAutocomplete = false
+              let shouldCorrect = false
               let text = ''
               let cursorCharIndex = 0
 
@@ -442,6 +535,7 @@ export function Editor() {
                 text = getGhostFreeTextContent($getRoot())
                 cursorCharIndex = getCursorCharacterIndex()
                 shouldAutocomplete = isAutocompleteEnabled && isCollapsedRange
+                shouldCorrect = isCollapsedRange && Boolean(text.trim())
               })
 
               if (!shouldAutocomplete) {
@@ -452,7 +546,12 @@ export function Editor() {
                 handleGhostDismiss()
               }
 
-              scheduleEdit({ text, cursorCharIndex, shouldAutocomplete })
+              scheduleEdit({
+                text,
+                cursorCharIndex,
+                shouldAutocomplete,
+                shouldCorrect,
+              })
             }}
           />
         </section>

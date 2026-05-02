@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
+import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Literal, Optional, TypedDict
 
 
 TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
@@ -31,6 +33,9 @@ DEFAULT_REWRITE_REPETITION_PENALTY = 1.05
 DEFAULT_REWRITE_MAX_NEW_TOKENS = 128
 DEFAULT_SPECULATIVE_DRAFT_TOKENS = 1
 DEFAULT_ENABLE_SPECULATIVE_REWRITE = True
+DEFAULT_FAST_PATH_MODE = "llama_instruct"
+DEFAULT_AUTOCOMPLETE_MAX_NEW_TOKENS = 12
+DEFAULT_CORRECTION_MAX_NEW_TOKENS = 256
 FIM_PREFIX = "<|fim_prefix|>"
 FIM_SUFFIX = "<|fim_suffix|>"
 FIM_MIDDLE = "<|fim_middle|>"
@@ -55,6 +60,44 @@ LLAMA3_STOP_TOKEN_IDS = (
     128001,  # <|end_of_text|>
     128009,  # <|eot_id|>
 )
+LLAMA_FAST_STOP_STRINGS = (
+    "<|eot_id|>",
+    "<|end_of_text|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|reserved_special_token",
+    "\n",
+)
+AUTOCOMPLETE_CODE_PATTERNS = (
+    "```",
+    "import ",
+    "from ",
+    "def ",
+    "class ",
+    "function ",
+    "const ",
+    "let ",
+    "var ",
+    "{",
+    "}",
+    "# ",
+    "##",
+)
+AUTOCOMPLETE_PREFACE_PATTERNS = (
+    "here is",
+    "here's",
+    "sure",
+    "certainly",
+    "the continuation",
+)
+CorrectionReason = Literal["grammar", "typo", "punctuation", "clarity"]
+
+
+class CorrectionSuggestion(TypedDict):
+    start: int
+    end: int
+    replacement: str
+    reason: CorrectionReason
 
 
 def _env_truthy(name: str) -> bool:
@@ -97,6 +140,57 @@ def build_qwen_fim_prompt(document_text: str, cursor_char_index: int) -> str:
     prefix = document_text[:cursor_char_index]
     suffix = document_text[cursor_char_index:]
     return f"{FIM_PREFIX}{prefix}{FIM_SUFFIX}{suffix}{FIM_MIDDLE}"
+
+
+def build_llama_autocomplete_prompt(
+    document_text: str,
+    cursor_char_index: int,
+    *,
+    prefix_chars: int = 1200,
+    suffix_chars: int = 300,
+) -> str:
+    cursor_char_index = clamp_cursor_index(document_text, cursor_char_index)
+    prefix = document_text[max(0, cursor_char_index - prefix_chars):cursor_char_index]
+    suffix = document_text[cursor_char_index:cursor_char_index + suffix_chars]
+    return (
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        "You are an editor autocomplete engine for normal prose. Continue the "
+        "text at the cursor with 1 to 8 words. Return only the continuation. "
+        "Do not write code, markdown, labels, explanations, alternatives, or a "
+        "complete paragraph. The continuation must fit naturally before the "
+        "suffix if one is provided."
+        "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"Before cursor:\n{prefix}\n\n"
+        f"After cursor:\n{suffix}\n\n"
+        "Return only the next words after the cursor."
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
+def build_llama_correction_prompt(
+    document_text: str,
+    cursor_char_index: int,
+    *,
+    window_chars: int = 1800,
+) -> tuple[str, int, str]:
+    cursor_char_index = clamp_cursor_index(document_text, cursor_char_index)
+    start = max(0, cursor_char_index - window_chars // 2)
+    end = min(len(document_text), cursor_char_index + window_chars // 2)
+    segment = document_text[start:end]
+    prompt = (
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        "You are a careful prose correction engine. Find only clear typos, "
+        "grammar, punctuation, or clarity issues in the provided text segment. "
+        "Return strict JSON only: an array of objects with start, end, "
+        "replacement, and reason. start and end must be character offsets "
+        "relative to the provided segment. reason must be one of grammar, typo, "
+        "punctuation, clarity. Return [] if no correction is needed."
+        "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"Text segment:\n{segment}\n\n"
+        "JSON:"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+    return prompt, start, segment
 
 
 def build_llama_rewrite_prompt(text: str, instruction: str) -> str:
@@ -245,6 +339,109 @@ def _first_present_value(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
+def trim_at_stop_strings(text: str, stop_strings: tuple[str, ...]) -> str:
+    stop_index: Optional[int] = None
+    for stop_string in stop_strings:
+        index = text.find(stop_string)
+        if index != -1 and (stop_index is None or index < stop_index):
+            stop_index = index
+    return text if stop_index is None else text[:stop_index]
+
+
+def sanitize_autocomplete_completion(
+    raw_completion: str,
+    document_text: str,
+    cursor_char_index: int,
+) -> str:
+    if any(pattern in raw_completion for pattern in AUTOCOMPLETE_CODE_PATTERNS):
+        return ""
+    completion = trim_at_stop_strings(raw_completion, LLAMA_FAST_STOP_STRINGS)
+    completion = completion.replace("\r", " ").replace("\n", " ").strip()
+    completion = completion.strip("\"'` ")
+    if not completion:
+        return ""
+
+    lower_completion = completion.lower()
+    if any(pattern in lower_completion for pattern in AUTOCOMPLETE_PREFACE_PATTERNS):
+        return ""
+    if any(pattern in completion for pattern in AUTOCOMPLETE_CODE_PATTERNS):
+        return ""
+
+    # Keep ghost text short and phrase-like.
+    sentence_match = re.search(r"([.!?])\s+", completion)
+    if sentence_match:
+        completion = completion[: sentence_match.end(1)]
+    words = completion.split()
+    if len(words) > 8:
+        completion = " ".join(words[:8])
+    if completion.count(".") + completion.count("!") + completion.count("?") > 1:
+        return ""
+
+    cursor_char_index = clamp_cursor_index(document_text, cursor_char_index)
+    prefix_tail = document_text[max(0, cursor_char_index - 120):cursor_char_index].lower()
+    suffix_head = document_text[cursor_char_index:cursor_char_index + 120].lower()
+    if completion.lower() and completion.lower() in prefix_tail:
+        return ""
+    if suffix_head.strip() and suffix_head.lstrip().startswith(completion.lower().strip()):
+        return ""
+    return completion
+
+
+def parse_correction_suggestions(
+    raw_completion: str,
+    segment_start: int,
+    segment_text: str,
+) -> list[CorrectionSuggestion]:
+    text = trim_at_stop_strings(raw_completion, LLAMA_FAST_STOP_STRINGS).strip()
+    if not text:
+        return []
+    start_index = text.find("[")
+    end_index = text.rfind("]")
+    if start_index == -1 or end_index == -1 or end_index < start_index:
+        return []
+    try:
+        parsed = json.loads(text[start_index : end_index + 1])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    suggestions: list[CorrectionSuggestion] = []
+    seen_spans: set[tuple[int, int, str]] = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        start = item.get("start")
+        end = item.get("end")
+        replacement = item.get("replacement")
+        reason = item.get("reason")
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        if not isinstance(replacement, str) or not replacement.strip():
+            continue
+        if reason not in {"grammar", "typo", "punctuation", "clarity"}:
+            continue
+        if start < 0 or end <= start or end > len(segment_text):
+            continue
+        if segment_text[start:end] == replacement:
+            continue
+        absolute_start = segment_start + start
+        absolute_end = segment_start + end
+        key = (absolute_start, absolute_end, replacement)
+        if key in seen_spans:
+            continue
+        seen_spans.add(key)
+        suggestions.append(
+            {
+                "start": absolute_start,
+                "end": absolute_end,
+                "replacement": replacement,
+                "reason": reason,
+            }
+        )
+    return suggestions[:5]
+
+
 class MockExLlamaEngine:
     """CPU-only stand-in with API parity for local WebSocket development."""
 
@@ -255,6 +452,7 @@ class MockExLlamaEngine:
         self.truncation_history: list[int] = []
         self.requires_full_prefill = False
         self.rewrite_max_new_tokens = DEFAULT_REWRITE_MAX_NEW_TOKENS
+        self.autocomplete_max_new_tokens = DEFAULT_AUTOCOMPLETE_MAX_NEW_TOKENS
 
     def reset(self) -> None:
         with self.gpu_lock:
@@ -307,7 +505,24 @@ class MockExLlamaEngine:
         cancel_event: Any,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Iterator[str]:
-        yield from self.generate_stream(cancel_event, max_new_tokens)
+        suggestion = sanitize_autocomplete_completion(
+            " next phrase",
+            document_text,
+            cursor_char_index,
+        )
+        if suggestion and not cancel_event.is_set():
+            time.sleep(0.05)
+            yield suggestion
+
+    def generate_corrections(
+        self,
+        document_text: str,
+        cursor_char_index: int,
+        cancel_event: Any,
+    ) -> list[CorrectionSuggestion]:
+        if cancel_event.is_set():
+            return []
+        return []
 
     def apply_rewrite(
         self,
@@ -332,6 +547,7 @@ class RealExLlamaEngine:
     def __init__(
         self,
         qwen_model_dir: str,
+        llama_fast_model_dir: str | None,
         llama_target_model_dir: str,
         llama_draft_model_dir: str | None,
         max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
@@ -344,6 +560,23 @@ class RealExLlamaEngine:
         self._qwen_last_token_id: Optional[int] = None
         self._qwen_next_logits: Optional[Any] = None
         self.requires_full_prefill = False
+        self.fast_path_mode = os.getenv("FAST_PATH_MODE", DEFAULT_FAST_PATH_MODE).strip().lower()
+        if self.fast_path_mode not in {"llama_instruct", "qwen_fim"}:
+            self.fast_path_mode = DEFAULT_FAST_PATH_MODE
+        self.autocomplete_max_new_tokens = max(
+            1,
+            _env_int(
+                "AUTOCOMPLETE_MAX_NEW_TOKENS",
+                DEFAULT_AUTOCOMPLETE_MAX_NEW_TOKENS,
+            ),
+        )
+        self.correction_max_new_tokens = max(
+            1,
+            _env_int(
+                "CORRECTION_MAX_NEW_TOKENS",
+                DEFAULT_CORRECTION_MAX_NEW_TOKENS,
+            ),
+        )
         self.enable_speculative_rewrite = _env_bool(
             "ENABLE_SPECULATIVE_REWRITE",
             DEFAULT_ENABLE_SPECULATIVE_REWRITE,
@@ -436,13 +669,29 @@ class RealExLlamaEngine:
             cache_cls=self.rewrite_cache_cls,
             cache_name="Q4 rewrite target",
         )
-        self.qwen = self._load_model_bundle(
-            "QWEN_AUTOCOMPLETE_MODEL_DIR",
-            qwen_model_dir,
-            load_tokenizer=True,
-            cache_cls=self.qwen_cache_cls,
-            cache_name="8-bit Qwen autocomplete",
-        )
+        self.qwen: ModelBundle | None = None
+        self.fast_llama: ModelBundle | None = None
+        if self.fast_path_mode == "qwen_fim":
+            self.qwen = self._load_model_bundle(
+                "QWEN_AUTOCOMPLETE_MODEL_DIR",
+                qwen_model_dir,
+                load_tokenizer=True,
+                cache_cls=self.qwen_cache_cls,
+                cache_name="8-bit Qwen autocomplete",
+            )
+        else:
+            if not llama_fast_model_dir:
+                raise RuntimeError(
+                    "LLAMA_FAST_MODEL_DIR is required when FAST_PATH_MODE is "
+                    "llama_instruct"
+                )
+            self.fast_llama = self._load_model_bundle(
+                "LLAMA_FAST_MODEL_DIR",
+                llama_fast_model_dir,
+                load_tokenizer=True,
+                cache_cls=self.qwen_cache_cls,
+                cache_name="8-bit Llama fast path",
+            )
         self.llama_draft: ModelBundle | None = None
         if self.enable_speculative_rewrite:
             if not llama_draft_model_dir:
@@ -458,17 +707,26 @@ class RealExLlamaEngine:
                 cache_name="Q4 rewrite draft",
             )
 
-        self.qwen_generator = self.streaming_generator_cls(
-            self.qwen.model,
-            self.qwen.cache,
-            self.qwen.tokenizer,
-        )
-        self.qwen_sampling_settings = self._build_sampling_settings(
+        if self.qwen is not None:
+            self.qwen_generator = self.streaming_generator_cls(
+                self.qwen.model,
+                self.qwen.cache,
+                self.qwen.tokenizer,
+            )
+        else:
+            assert self.fast_llama is not None
+            self.fast_generator = self.streaming_generator_cls(
+                self.fast_llama.model,
+                self.fast_llama.cache,
+                self.fast_llama.tokenizer,
+            )
+        self.fast_sampling_settings = self._build_sampling_settings(
             self.qwen_temperature,
             self.qwen_top_p,
             self.qwen_top_k,
             self.qwen_repetition_penalty,
         )
+        self.qwen_sampling_settings = self.fast_sampling_settings
 
         if self.enable_speculative_rewrite:
             assert self.llama_draft is not None
@@ -579,7 +837,10 @@ class RealExLlamaEngine:
 
     def reset(self) -> None:
         with self.gpu_lock:
-            self.qwen.cache.current_seq_len = 0
+            if self.qwen is not None:
+                self.qwen.cache.current_seq_len = 0
+            if self.fast_llama is not None:
+                self.fast_llama.cache.current_seq_len = 0
             self.current_seq_len = 0
             self._qwen_last_token_id = None
             self._qwen_next_logits = None
@@ -596,7 +857,10 @@ class RealExLlamaEngine:
                     f"Cannot truncate to {safe_token_index}; current_seq_len "
                     f"is only {self.current_seq_len}"
                 )
-            self.qwen.cache.current_seq_len = safe_token_index
+            if self.qwen is not None:
+                self.qwen.cache.current_seq_len = safe_token_index
+            if self.fast_llama is not None:
+                self.fast_llama.cache.current_seq_len = 0
             self.current_seq_len = safe_token_index
             if safe_token_index == 0:
                 self._qwen_last_token_id = None
@@ -608,6 +872,10 @@ class RealExLlamaEngine:
             raise ValueError("forward_prefill called with an empty token list")
 
         with self.gpu_lock, self.torch.inference_mode():
+            if self.qwen is None:
+                self.current_seq_len += len(token_ids)
+                self.requires_full_prefill = False
+                return
             input_ids = self.torch.tensor([token_ids], dtype=self.torch.long)
             self._qwen_next_logits = self.qwen.model.forward(input_ids, self.qwen.cache)
             self.current_seq_len = self.qwen.cache.current_seq_len
@@ -621,7 +889,17 @@ class RealExLlamaEngine:
         cancel_event: Any,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Iterator[str]:
+        if self.fast_path_mode == "llama_instruct":
+            yield from self._generate_llama_autocomplete_stream(
+                document_text,
+                cursor_char_index,
+                cancel_event,
+                min(max_new_tokens, self.autocomplete_max_new_tokens),
+            )
+            return
+
         telemetry = TelemetryStats("FAST-PATH", time.perf_counter())
+        assert self.qwen is not None
         prompt = build_qwen_fim_prompt(document_text, cursor_char_index)
         prompt_token_ids = self._encode_prompt(self.qwen.tokenizer, prompt)
         if not prompt_token_ids:
@@ -663,6 +941,111 @@ class RealExLlamaEngine:
                     yield chunk
                 if result.get("eos", False):
                     break
+        finally:
+            telemetry.log()
+
+    def _generate_llama_autocomplete_stream(
+        self,
+        document_text: str,
+        cursor_char_index: int,
+        cancel_event: Any,
+        max_new_tokens: int,
+    ) -> Iterator[str]:
+        telemetry = TelemetryStats("FAST-PATH", time.perf_counter())
+        assert self.fast_llama is not None
+        prompt = build_llama_autocomplete_prompt(document_text, cursor_char_index)
+        prompt_token_ids = self._encode_prompt(self.fast_llama.tokenizer, prompt)
+        if not prompt_token_ids:
+            telemetry.log()
+            return
+
+        input_ids = self.torch.tensor([prompt_token_ids], dtype=self.torch.long)
+        raw_completion = ""
+        try:
+            with self.gpu_lock, self.torch.inference_mode():
+                self.fast_generator.set_stop_conditions(self._llama_fast_stop_conditions())
+                self.fast_generator.begin_stream_ex(
+                    input_ids,
+                    self.fast_sampling_settings,
+                    token_healing=False,
+                )
+
+            for _ in range(max_new_tokens):
+                if cancel_event.is_set():
+                    break
+
+                with self.gpu_lock, self.torch.inference_mode():
+                    result = self.fast_generator.stream_ex()
+
+                chunk = str(result.get("chunk") or result.get("text") or "")
+                if chunk:
+                    raw_completion += chunk
+                    telemetry.observe_chunk(chunk, self._result_token_count(result))
+                if result.get("eos", False):
+                    break
+                if any(stop in raw_completion for stop in LLAMA_FAST_STOP_STRINGS):
+                    break
+
+            suggestion = sanitize_autocomplete_completion(
+                raw_completion,
+                document_text,
+                cursor_char_index,
+            )
+            if suggestion and not cancel_event.is_set():
+                yield suggestion
+        finally:
+            telemetry.log()
+
+    def generate_corrections(
+        self,
+        document_text: str,
+        cursor_char_index: int,
+        cancel_event: Any,
+    ) -> list[CorrectionSuggestion]:
+        if self.fast_path_mode != "llama_instruct":
+            return []
+        telemetry = TelemetryStats("CORRECTION-PATH", time.perf_counter())
+        assert self.fast_llama is not None
+        prompt, segment_start, segment_text = build_llama_correction_prompt(
+            document_text,
+            cursor_char_index,
+        )
+        prompt_token_ids = self._encode_prompt(self.fast_llama.tokenizer, prompt)
+        if not prompt_token_ids:
+            telemetry.log()
+            return []
+
+        input_ids = self.torch.tensor([prompt_token_ids], dtype=self.torch.long)
+        raw_completion = ""
+        try:
+            with self.gpu_lock, self.torch.inference_mode():
+                self.fast_generator.set_stop_conditions(self._llama_fast_stop_conditions())
+                self.fast_generator.begin_stream_ex(
+                    input_ids,
+                    self.fast_sampling_settings,
+                    token_healing=False,
+                )
+
+            for _ in range(self.correction_max_new_tokens):
+                if cancel_event.is_set():
+                    return []
+
+                with self.gpu_lock, self.torch.inference_mode():
+                    result = self.fast_generator.stream_ex()
+
+                chunk = str(result.get("chunk") or result.get("text") or "")
+                if chunk:
+                    raw_completion += chunk
+                    telemetry.observe_chunk(chunk, self._result_token_count(result))
+                if result.get("eos", False):
+                    break
+                if "<|eot_id|>" in raw_completion or "<|end_of_text|>" in raw_completion:
+                    break
+            return parse_correction_suggestions(
+                raw_completion,
+                segment_start,
+                segment_text,
+            )
         finally:
             telemetry.log()
 
@@ -1166,7 +1549,7 @@ class RealExLlamaEngine:
         generated_token_ids: list[int] = []
         emitted_text = ""
 
-        if self._qwen_last_token_id is None:
+        if self.qwen is None or self._qwen_last_token_id is None:
             return
 
         input_token: Optional[Any] = None
@@ -1234,10 +1617,23 @@ class RealExLlamaEngine:
         return [int(token_id) for token_id in encoded]
 
     def _autocomplete_stop_conditions(self) -> list[Any]:
+        assert self.qwen is not None
         stop_conditions: list[Any] = list(QWEN_FIM_STOP_STRINGS)
         eos_token_id = getattr(self.qwen.tokenizer, "eos_token_id", None)
         if eos_token_id is not None:
             stop_conditions.append(eos_token_id)
+        return stop_conditions
+
+    def _llama_fast_stop_conditions(self) -> list[Any]:
+        assert self.fast_llama is not None
+        stop_conditions: list[Any] = list(LLAMA_FAST_STOP_STRINGS)
+        eos_token_id = getattr(self.fast_llama.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, (list, tuple, set)):
+                stop_conditions.extend(eos_token_id)
+            else:
+                stop_conditions.append(eos_token_id)
+        stop_conditions.extend(LLAMA3_STOP_TOKEN_IDS)
         return stop_conditions
 
     def _sample_next_token(self, logits: Any, generated_token_ids: list[int]) -> int:
@@ -1355,15 +1751,19 @@ def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:
         "ENABLE_SPECULATIVE_REWRITE",
         DEFAULT_ENABLE_SPECULATIVE_REWRITE,
     )
+    fast_path_mode = os.getenv("FAST_PATH_MODE", DEFAULT_FAST_PATH_MODE).strip().lower()
     qwen_model_dir = os.getenv("QWEN_AUTOCOMPLETE_MODEL_DIR") or os.getenv(
         "EXLLAMA_MODEL_DIR"
     )
+    llama_fast_model_dir = os.getenv("LLAMA_FAST_MODEL_DIR")
     llama_target_model_dir = os.getenv("LLAMA_REWRITE_TARGET_MODEL_DIR")
     llama_draft_model_dir = os.getenv("LLAMA_REWRITE_DRAFT_MODEL_DIR")
 
     missing_env_vars = []
-    if not qwen_model_dir:
+    if fast_path_mode == "qwen_fim" and not qwen_model_dir:
         missing_env_vars.append("QWEN_AUTOCOMPLETE_MODEL_DIR")
+    if fast_path_mode != "qwen_fim" and not llama_fast_model_dir:
+        missing_env_vars.append("LLAMA_FAST_MODEL_DIR")
     if not llama_target_model_dir:
         missing_env_vars.append("LLAMA_REWRITE_TARGET_MODEL_DIR")
     if enable_speculative_rewrite and not llama_draft_model_dir:
@@ -1376,7 +1776,8 @@ def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:
         )
 
     return RealExLlamaEngine(
-        qwen_model_dir=qwen_model_dir,
+        qwen_model_dir=qwen_model_dir or "",
+        llama_fast_model_dir=llama_fast_model_dir,
         llama_target_model_dir=llama_target_model_dir,
         llama_draft_model_dir=llama_draft_model_dir,
         max_seq_len=_env_int("MAX_SEQ_LEN", DEFAULT_MAX_SEQ_LEN),

@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-type StreamPayloadType = 'token' | 'done' | 'cancelled' | 'server_error'
+type StreamPayloadType = 'token' | 'corrections' | 'done' | 'cancelled' | 'server_error'
 
 type OutgoingEditorMessage = {
-  action: 'edit' | 'autocomplete'
+  action: 'edit' | 'autocomplete' | 'correct'
   newText: string
   editCharIndex: number
 }
@@ -22,7 +22,7 @@ export type IncomingEditorMessage = {
 
 type WireEditorPayload = {
   request_id: string
-  action: 'edit' | 'autocomplete'
+  action: 'edit' | 'autocomplete' | 'correct'
   new_text: string
   edit_char_index: number
 }
@@ -151,7 +151,7 @@ export function useEditorSocket({
     const socket = socketRef.current
 
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return false
+      return null
     }
 
     const payload: WireEditorPayload = {
@@ -163,7 +163,7 @@ export function useEditorSocket({
 
     socket.send(JSON.stringify(payload))
     console.info('editor socket sent', payload)
-    return true
+    return payload.request_id
   }, [])
 
   const sendRewriteRequest = useCallback((message: OutgoingRewriteMessage) => {

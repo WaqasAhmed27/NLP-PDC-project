@@ -33,6 +33,11 @@ def test_autocomplete_payload_requires_editor_fields() -> None:
         EditorPayload(request_id="auto-1", action="autocomplete", new_text="hello")
 
 
+def test_correct_payload_requires_editor_fields() -> None:
+    with pytest.raises(ValidationError):
+        EditorPayload(request_id="correct-1", action="correct", new_text="hello")
+
+
 class FakeWebSocket:
     def __init__(self) -> None:
         self.payloads = []

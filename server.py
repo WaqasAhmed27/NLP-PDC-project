@@ -9,6 +9,7 @@ state manager applies the incoming edit.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any, Iterator, Literal, Optional
 
@@ -27,7 +28,7 @@ class EditorPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_id: str
-    action: Literal["edit", "autocomplete", "rewrite"]
+    action: Literal["edit", "autocomplete", "correct", "rewrite"]
     new_text: Optional[str] = None
     edit_char_index: Optional[int] = None
     text: Optional[str] = None
@@ -35,10 +36,10 @@ class EditorPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> "EditorPayload":
-        if self.action in {"edit", "autocomplete"}:
+        if self.action in {"edit", "autocomplete", "correct"}:
             if self.new_text is None or self.edit_char_index is None:
                 raise ValueError(
-                    "edit/autocomplete payloads require new_text and edit_char_index"
+                    "edit/autocomplete/correct payloads require new_text and edit_char_index"
                 )
         if self.action == "rewrite":
             if self.text is None or self.prompt is None:
@@ -50,7 +51,7 @@ class StreamPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_id: str
-    type: Literal["token", "done", "cancelled", "server_error"]
+    type: Literal["token", "corrections", "done", "cancelled", "server_error"]
     chunk: str
     latency_ms: int
 
@@ -85,12 +86,12 @@ class GenerationTaskManager:
         self.send_lock = asyncio.Lock()
         self.current_task: Optional[asyncio.Task[None]] = None
         self.current_cancel_event: Optional[asyncio.Event] = None
-        self.current_action: Optional[Literal["autocomplete", "rewrite"]] = None
+        self.current_action: Optional[Literal["autocomplete", "correct", "rewrite"]] = None
 
     async def handle_payload(self, payload: EditorPayload) -> None:
         started_at = time.perf_counter()
 
-        if self.is_rewrite_active() and payload.action in {"edit", "autocomplete"}:
+        if self.is_rewrite_active() and payload.action in {"edit", "autocomplete", "correct"}:
             print(
                 "Ignoring payload while rewrite is active: "
                 f"action={payload.action} request_id={payload.request_id}",
@@ -134,6 +135,15 @@ class GenerationTaskManager:
                 payload_type="done",
                 chunk=f"state_updated tokens={edit_result.total_cache_len}",
                 started_at=started_at,
+            )
+            return
+
+        if payload.action == "correct":
+            cancel_event = asyncio.Event()
+            self.current_cancel_event = cancel_event
+            self.current_action = "correct"
+            self.current_task = asyncio.create_task(
+                self.run_correction(payload, cancel_event)
             )
             return
 
@@ -278,6 +288,70 @@ class GenerationTaskManager:
                 self.current_cancel_event = None
                 self.current_action = None
 
+    async def run_correction(
+        self,
+        payload: EditorPayload,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        started_at = time.perf_counter()
+        cancelled = False
+        failed = False
+        try:
+            assert payload.edit_char_index is not None
+            corrections = await asyncio.to_thread(
+                self.manager.engine.generate_corrections,
+                self.manager.current_text,
+                min(
+                    max(payload.edit_char_index, 0),
+                    len(self.manager.current_text),
+                ),
+                cancel_event,
+            )
+            if cancel_event.is_set():
+                cancelled = True
+                return
+            await self.safe_send_stream_payload(
+                request_id=payload.request_id,
+                payload_type="corrections",
+                chunk=json.dumps(corrections),
+                started_at=started_at,
+            )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as exc:
+            failed = True
+            print(
+                "Correction exception: "
+                f"request_id={payload.request_id} {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            await self.safe_send_stream_payload(
+                request_id=payload.request_id,
+                payload_type="server_error",
+                chunk=f"correction_error: {type(exc).__name__}: {exc}",
+                started_at=started_at,
+            )
+        finally:
+            if cancelled:
+                await self.safe_send_stream_payload(
+                    request_id=payload.request_id,
+                    payload_type="cancelled",
+                    chunk="",
+                    started_at=started_at,
+                )
+            elif not failed and not cancel_event.is_set():
+                await self.safe_send_stream_payload(
+                    request_id=payload.request_id,
+                    payload_type="done",
+                    chunk="",
+                    started_at=started_at,
+                )
+            if self.current_task is asyncio.current_task():
+                self.current_task = None
+                self.current_cancel_event = None
+                self.current_action = None
+
     async def create_token_iterator(
         self,
         payload: EditorPayload,
@@ -330,7 +404,7 @@ class GenerationTaskManager:
         self,
         *,
         request_id: str,
-        payload_type: Literal["token", "done", "cancelled", "server_error"],
+        payload_type: Literal["token", "corrections", "done", "cancelled", "server_error"],
         chunk: str,
         started_at: float,
     ) -> None:

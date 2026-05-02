@@ -119,6 +119,82 @@
   user-select: none;
 }
 
+.correction-panel {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 10;
+  width: min(360px, calc(100% - 28px));
+  border: 1px solid #d6d9e6;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 14px 32px rgba(24, 28, 40, 0.14);
+  overflow: hidden;
+}
+
+.correction-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid #eef1f7;
+  color: #323645;
+  font: 700 13px/1.2 system-ui, sans-serif;
+}
+
+.correction-list {
+  display: grid;
+  gap: 0;
+}
+
+.correction-item {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.correction-item + .correction-item {
+  border-top: 1px solid #eef1f7;
+}
+
+.correction-copy {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.correction-reason {
+  color: #5f6678;
+  font: 700 11px/1.2 system-ui, sans-serif;
+  text-transform: uppercase;
+}
+
+.correction-replacement {
+  color: #141722;
+  font: 14px/1.35 system-ui, sans-serif;
+  overflow-wrap: anywhere;
+}
+
+.correction-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.correction-actions button {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #cfd5e2;
+  border-radius: 6px;
+  color: #202432;
+  background: #f8f9fc;
+  font: 700 13px/1 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.correction-actions button:hover {
+  background: #eef1f7;
+}
+
 .editor-placeholder {
   position: absolute;
   top: 24px;
