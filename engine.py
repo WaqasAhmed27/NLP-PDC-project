@@ -97,6 +97,16 @@ AUTOCOMPLETE_PROMPT_LABEL_PATTERNS = (
     "json",
     "text segment",
 )
+AUTOCOMPLETE_INSTRUCTION_LEAK_PATTERNS = (
+    "you are an editor autocomplete engine",
+    "for normal prose",
+    "continue the text at the cursor",
+    "return only the continuation",
+    "return only the next words after the cursor",
+    "next words after the cursor",
+    "one word after the cursor",
+    "after the cursor",
+)
 CorrectionReason = Literal["grammar", "typo", "punctuation", "clarity"]
 
 
@@ -374,6 +384,8 @@ def sanitize_autocomplete_completion(
 
     lower_completion = completion.lower()
     if any(pattern in lower_completion for pattern in AUTOCOMPLETE_PREFACE_PATTERNS):
+        return ""
+    if any(pattern in lower_completion for pattern in AUTOCOMPLETE_INSTRUCTION_LEAK_PATTERNS):
         return ""
     if starts_with_autocomplete_prompt_label(lower_completion):
         return ""
