@@ -90,6 +90,13 @@ AUTOCOMPLETE_PREFACE_PATTERNS = (
     "certainly",
     "the continuation",
 )
+AUTOCOMPLETE_PROMPT_LABEL_PATTERNS = (
+    "before cursor",
+    "after cursor",
+    "return only",
+    "json",
+    "text segment",
+)
 CorrectionReason = Literal["grammar", "typo", "punctuation", "clarity"]
 
 
@@ -361,8 +368,14 @@ def sanitize_autocomplete_completion(
     if not completion:
         return ""
 
+    completion = strip_autocomplete_prompt_label(completion)
+    if not completion:
+        return ""
+
     lower_completion = completion.lower()
     if any(pattern in lower_completion for pattern in AUTOCOMPLETE_PREFACE_PATTERNS):
+        return ""
+    if starts_with_autocomplete_prompt_label(lower_completion):
         return ""
     if any(pattern in completion for pattern in AUTOCOMPLETE_CODE_PATTERNS):
         return ""
@@ -385,6 +398,25 @@ def sanitize_autocomplete_completion(
     if suffix_head.strip() and suffix_head.lstrip().startswith(completion.lower().strip()):
         return ""
     return completion
+
+
+def starts_with_autocomplete_prompt_label(lower_completion: str) -> bool:
+    return any(
+        lower_completion.startswith(pattern)
+        for pattern in AUTOCOMPLETE_PROMPT_LABEL_PATTERNS
+    )
+
+
+def strip_autocomplete_prompt_label(completion: str) -> str:
+    stripped = completion.strip()
+    match = re.match(
+        r"^(before cursor|after cursor|return only(?: the next words after the cursor)?|json|text segment)\s*:?\s*",
+        stripped,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return stripped
+    return stripped[match.end() :].strip("\"'` ")
 
 
 def parse_correction_suggestions(

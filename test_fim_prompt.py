@@ -84,8 +84,16 @@ def test_llama_autocomplete_prompt_uses_prefix_suffix_context() -> None:
 def test_autocomplete_sanitizer_rejects_code_and_prefaces() -> None:
     assert sanitize_autocomplete_completion("```python\nprint(1)", "Hello", 5) == ""
     assert sanitize_autocomplete_completion("Here is the continuation", "Hello", 5) == ""
+    assert sanitize_autocomplete_completion("After cursor:", "Hello", 5) == ""
+    assert sanitize_autocomplete_completion("Before cursor:", "Hello", 5) == ""
     assert sanitize_autocomplete_completion(" gentle useful words for today", "Hello", 5) == (
         "gentle useful words for today"
+    )
+
+
+def test_autocomplete_sanitizer_strips_prompt_label_when_content_follows() -> None:
+    assert sanitize_autocomplete_completion("After cursor: should proceed carefully", "The team", 8) == (
+        "should proceed carefully"
     )
 
 

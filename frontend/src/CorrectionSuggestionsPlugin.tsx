@@ -1,6 +1,13 @@
 import { useCallback } from 'react'
-import { $createParagraphNode, $createTextNode, $getRoot } from 'lexical'
+import {
+  $createParagraphNode,
+  $createTextNode,
+  $getRoot,
+  $isElementNode,
+  type LexicalNode,
+} from 'lexical'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
+import { $isAutocompleteNode } from './AutocompleteNode'
 
 export type CorrectionSuggestion = {
   id: string
@@ -17,7 +24,24 @@ type CorrectionSuggestionsPluginProps = {
 }
 
 function getPlainTextFromRoot() {
-  return $getRoot().getTextContent()
+  return getGhostFreeTextContent($getRoot())
+}
+
+function getGhostFreeTextContent(node: LexicalNode): string {
+  if ($isAutocompleteNode(node)) {
+    return ''
+  }
+
+  if (!$isElementNode(node)) {
+    return node.getTextContent()
+  }
+
+  const children = node.getChildren()
+  const isRoot = node.getParent() === null
+
+  return children
+    .map((child) => getGhostFreeTextContent(child))
+    .join(isRoot ? '\n' : '')
 }
 
 function replaceTextRange(text: string, start: number, end: number, replacement: string) {
@@ -53,6 +77,10 @@ export function CorrectionSuggestionsPlugin({
           suggestion.end <= suggestion.start ||
           suggestion.end > currentText.length
         ) {
+          console.warn('Ignoring stale correction suggestion', {
+            suggestion,
+            currentTextLength: currentText.length,
+          })
           return
         }
         nextText = replaceTextRange(
