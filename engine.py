@@ -50,6 +50,16 @@ QWEN_FIM_STOP_STRINGS = (
     "<|endoftext|>",
     "</s>",
 )
+GRANITE_FIM_STOP_STRINGS = (
+    FIM_PREFIX,
+    FIM_SUFFIX,
+    FIM_MIDDLE,
+    FIM_PAD,
+    "<|start_of_role|>",
+    "<|end_of_role|>",
+    "<|end_of_text|>",
+    "<|pad|>",
+)
 LLAMA_REWRITE_STOP_STRINGS = (
     "<|eot_id|>",
     "<|end_of_text|>",
@@ -591,6 +601,7 @@ class RealExLlamaEngine:
     def __init__(
         self,
         qwen_model_dir: str,
+        granite_fim_model_dir: str,
         llama_fast_model_dir: str | None,
         llama_target_model_dir: str,
         llama_draft_model_dir: str | None,
@@ -605,7 +616,7 @@ class RealExLlamaEngine:
         self._qwen_next_logits: Optional[Any] = None
         self.requires_full_prefill = False
         self.fast_path_mode = os.getenv("FAST_PATH_MODE", DEFAULT_FAST_PATH_MODE).strip().lower()
-        if self.fast_path_mode not in {"llama_instruct", "qwen_fim"}:
+        if self.fast_path_mode not in {"llama_instruct", "qwen_fim", "granite_fim"}:
             self.fast_path_mode = DEFAULT_FAST_PATH_MODE
         self.autocomplete_max_new_tokens = max(
             1,
@@ -714,6 +725,7 @@ class RealExLlamaEngine:
             cache_name="Q4 rewrite target",
         )
         self.qwen: ModelBundle | None = None
+        self.granite_fim: ModelBundle | None = None
         self.fast_llama: ModelBundle | None = None
         if self.fast_path_mode == "qwen_fim":
             self.qwen = self._load_model_bundle(
@@ -722,6 +734,19 @@ class RealExLlamaEngine:
                 load_tokenizer=True,
                 cache_cls=self.qwen_cache_cls,
                 cache_name="8-bit Qwen autocomplete",
+            )
+        elif self.fast_path_mode == "granite_fim":
+            if not granite_fim_model_dir:
+                raise RuntimeError(
+                    "GRANITE_FIM_MODEL_DIR is required when FAST_PATH_MODE is "
+                    "granite_fim"
+                )
+            self.granite_fim = self._load_model_bundle(
+                "GRANITE_FIM_MODEL_DIR",
+                granite_fim_model_dir,
+                load_tokenizer=True,
+                cache_cls=self.qwen_cache_cls,
+                cache_name="8-bit Granite FIM autocomplete",
             )
         else:
             if not llama_fast_model_dir:
@@ -756,6 +781,12 @@ class RealExLlamaEngine:
                 self.qwen.model,
                 self.qwen.cache,
                 self.qwen.tokenizer,
+            )
+        elif self.granite_fim is not None:
+            self.granite_fim_generator = self.streaming_generator_cls(
+                self.granite_fim.model,
+                self.granite_fim.cache,
+                self.granite_fim.tokenizer,
             )
         else:
             assert self.fast_llama is not None
@@ -883,6 +914,8 @@ class RealExLlamaEngine:
         with self.gpu_lock:
             if self.qwen is not None:
                 self.qwen.cache.current_seq_len = 0
+            if self.granite_fim is not None:
+                self.granite_fim.cache.current_seq_len = 0
             if self.fast_llama is not None:
                 self.fast_llama.cache.current_seq_len = 0
             self.current_seq_len = 0
@@ -903,6 +936,8 @@ class RealExLlamaEngine:
                 )
             if self.qwen is not None:
                 self.qwen.cache.current_seq_len = safe_token_index
+            if self.granite_fim is not None:
+                self.granite_fim.cache.current_seq_len = safe_token_index
             if self.fast_llama is not None:
                 self.fast_llama.cache.current_seq_len = 0
             self.current_seq_len = safe_token_index
@@ -941,6 +976,14 @@ class RealExLlamaEngine:
                 min(max_new_tokens, self.autocomplete_max_new_tokens),
             )
             return
+        if self.fast_path_mode == "granite_fim":
+            yield from self._generate_granite_fim_autocomplete_stream(
+                document_text,
+                cursor_char_index,
+                cancel_event,
+                max_new_tokens,
+            )
+            return
 
         telemetry = TelemetryStats("FAST-PATH", time.perf_counter())
         assert self.qwen is not None
@@ -975,6 +1018,58 @@ class RealExLlamaEngine:
                 with self.gpu_lock, self.torch.inference_mode():
                     result = self.qwen_generator.stream_ex()
                     self.current_seq_len = self.qwen.cache.current_seq_len
+
+                chunk = result.get("chunk", "")
+                if chunk:
+                    telemetry.observe_chunk(
+                        chunk,
+                        self._result_token_count(result),
+                    )
+                    yield chunk
+                if result.get("eos", False):
+                    break
+        finally:
+            telemetry.log()
+
+    def _generate_granite_fim_autocomplete_stream(
+        self,
+        document_text: str,
+        cursor_char_index: int,
+        cancel_event: Any,
+        max_new_tokens: int,
+    ) -> Iterator[str]:
+        telemetry = TelemetryStats("FAST-PATH", time.perf_counter())
+        assert self.granite_fim is not None
+        prompt = build_qwen_fim_prompt(document_text, cursor_char_index)
+        prompt_token_ids = self._encode_prompt(self.granite_fim.tokenizer, prompt)
+        if not prompt_token_ids:
+            telemetry.log()
+            return
+
+        input_ids = self.torch.tensor([prompt_token_ids], dtype=self.torch.long)
+
+        try:
+            with self.gpu_lock, self.torch.inference_mode():
+                self.granite_fim_generator.set_stop_conditions(
+                    self._granite_fim_stop_conditions()
+                )
+                self.granite_fim_generator.begin_stream_ex(
+                    input_ids,
+                    self.fast_sampling_settings,
+                    token_healing=False,
+                )
+                self.current_seq_len = self.granite_fim.cache.current_seq_len
+                self._qwen_last_token_id = int(prompt_token_ids[-1])
+                self._qwen_next_logits = None
+                self.requires_full_prefill = True
+
+            for _ in range(max_new_tokens):
+                if cancel_event.is_set():
+                    break
+
+                with self.gpu_lock, self.torch.inference_mode():
+                    result = self.granite_fim_generator.stream_ex()
+                    self.current_seq_len = self.granite_fim.cache.current_seq_len
 
                 chunk = result.get("chunk", "")
                 if chunk:
@@ -1668,6 +1763,17 @@ class RealExLlamaEngine:
             stop_conditions.append(eos_token_id)
         return stop_conditions
 
+    def _granite_fim_stop_conditions(self) -> list[Any]:
+        assert self.granite_fim is not None
+        stop_conditions: list[Any] = list(GRANITE_FIM_STOP_STRINGS)
+        eos_token_id = getattr(self.granite_fim.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, (list, tuple, set)):
+                stop_conditions.extend(eos_token_id)
+            else:
+                stop_conditions.append(eos_token_id)
+        return stop_conditions
+
     def _llama_fast_stop_conditions(self) -> list[Any]:
         assert self.fast_llama is not None
         stop_conditions: list[Any] = list(LLAMA_FAST_STOP_STRINGS)
@@ -1799,6 +1905,7 @@ def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:
     qwen_model_dir = os.getenv("QWEN_AUTOCOMPLETE_MODEL_DIR") or os.getenv(
         "EXLLAMA_MODEL_DIR"
     )
+    granite_fim_model_dir = os.getenv("GRANITE_FIM_MODEL_DIR")
     llama_fast_model_dir = os.getenv("LLAMA_FAST_MODEL_DIR")
     llama_target_model_dir = os.getenv("LLAMA_REWRITE_TARGET_MODEL_DIR")
     llama_draft_model_dir = os.getenv("LLAMA_REWRITE_DRAFT_MODEL_DIR")
@@ -1806,7 +1913,9 @@ def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:
     missing_env_vars = []
     if fast_path_mode == "qwen_fim" and not qwen_model_dir:
         missing_env_vars.append("QWEN_AUTOCOMPLETE_MODEL_DIR")
-    if fast_path_mode != "qwen_fim" and not llama_fast_model_dir:
+    if fast_path_mode == "granite_fim" and not granite_fim_model_dir:
+        missing_env_vars.append("GRANITE_FIM_MODEL_DIR")
+    if fast_path_mode == "llama_instruct" and not llama_fast_model_dir:
         missing_env_vars.append("LLAMA_FAST_MODEL_DIR")
     if not llama_target_model_dir:
         missing_env_vars.append("LLAMA_REWRITE_TARGET_MODEL_DIR")
@@ -1821,6 +1930,7 @@ def get_engine() -> MockExLlamaEngine | RealExLlamaEngine:
 
     return RealExLlamaEngine(
         qwen_model_dir=qwen_model_dir or "",
+        granite_fim_model_dir=granite_fim_model_dir or "",
         llama_fast_model_dir=llama_fast_model_dir,
         llama_target_model_dir=llama_target_model_dir,
         llama_draft_model_dir=llama_draft_model_dir,
