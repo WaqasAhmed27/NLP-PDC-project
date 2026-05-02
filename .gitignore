@@ -142,3 +142,14 @@ pnpm-debug.log*
 
 # Models
 models/
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Test dependencies
+test_deps/
+
+# Benchmark artifacts
+tests/benchmarks/outputs/
+.playwright-mcp/

@@ -11,3 +11,4 @@ packaging
 ninja
 psutil
 flash-attn>=2.5.7
+matplotlib>=3.8

@@ -22,9 +22,22 @@ type PendingEdit = {
   shouldCorrect: boolean
 }
 
+type DocumentStats = {
+  words: number
+  characters: number
+}
+
+type ActivityEntry = {
+  id: number
+  label: string
+  detail: string
+  time: string
+}
+
 const EDIT_DEBOUNCE_MS = 50
 const AUTOCOMPLETE_DEBOUNCE_MS = 250
 const CORRECTION_DEBOUNCE_MS = 1200
+const MAX_ACTIVITY_ENTRIES = 6
 
 const lexicalTheme = {
   paragraph: 'editor-paragraph',
@@ -142,6 +155,57 @@ function getFirstChangedCharacterIndex(previousText: string, nextText: string) {
   return maxSharedLength
 }
 
+function getDocumentStats(text: string): DocumentStats {
+  const trimmedText = text.trim()
+
+  return {
+    words: trimmedText ? trimmedText.split(/\s+/).length : 0,
+    characters: text.length,
+  }
+}
+
+function formatActivityTime() {
+  return new Date().toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function summarizeChunk(chunk: string) {
+  const normalized = chunk.replace(/\s+/g, ' ').trim()
+
+  if (!normalized) {
+    return ''
+  }
+
+  return normalized.length > 72 ? `${normalized.slice(0, 72)}...` : normalized
+}
+
+function getMessageSummary(payload: IncomingEditorMessage) {
+  if (payload.type === 'token') {
+    return payload.chunk ? `token: "${summarizeChunk(payload.chunk)}"` : 'token'
+  }
+
+  if (payload.type === 'corrections') {
+    return 'corrections received'
+  }
+
+  if (payload.type === 'done') {
+    return 'generation complete'
+  }
+
+  if (payload.type === 'cancelled') {
+    return 'generation cancelled'
+  }
+
+  if (payload.type === 'server_error') {
+    return payload.chunk ? `error: ${summarizeChunk(payload.chunk)}` : 'server error'
+  }
+
+  return payload.type
+}
+
 export function Editor() {
   const debounceTimerRef = useRef<number | null>(null)
   const autocompleteTimerRef = useRef<number | null>(null)
@@ -157,16 +221,36 @@ export function Editor() {
   const tokenChunkIdRef = useRef(0)
   const rewriteChunkIdRef = useRef(0)
   const rewriteDoneIdRef = useRef(0)
+  const activityIdRef = useRef(0)
   const [lastMessage, setLastMessage] = useState<IncomingEditorMessage | null>(null)
   const [tokenChunk, setTokenChunk] = useState<TokenChunkEvent | null>(null)
   const [rewriteChunks, setRewriteChunks] = useState<TokenChunkEvent[]>([])
   const [rewriteDoneId, setRewriteDoneId] = useState(0)
   const [correctionSuggestions, setCorrectionSuggestions] = useState<CorrectionSuggestion[]>([])
+  const [documentStats, setDocumentStats] = useState<DocumentStats>({
+    words: 0,
+    characters: 0,
+  })
+  const [activityLog, setActivityLog] = useState<ActivityEntry[]>([])
   const [isAutocompleteEnabled, setIsAutocompleteEnabled] = useState(true)
   const [isRewriteEnabled, setIsRewriteEnabled] = useState(true)
+  const [isCorrectionEnabled, setIsCorrectionEnabled] = useState(true)
+
+  const appendActivity = useCallback((label: string, detail: string) => {
+    activityIdRef.current += 1
+    const entry = {
+      id: activityIdRef.current,
+      label,
+      detail,
+      time: formatActivityTime(),
+    }
+
+    setActivityLog((entries) => [entry, ...entries].slice(0, MAX_ACTIVITY_ENTRIES))
+  }, [])
 
   const handleSocketMessage = useCallback((payload: IncomingEditorMessage) => {
     setLastMessage(payload)
+    appendActivity(payload.type, getMessageSummary(payload))
 
     if (payload.request_id === activeRewriteRequestIdRef.current) {
       if (payload.type === 'token' && payload.chunk) {
@@ -194,6 +278,10 @@ export function Editor() {
     }
 
     if (payload.type === 'corrections') {
+      if (!isCorrectionEnabled) {
+        return
+      }
+
       if (payload.request_id !== latestCorrectionRequestIdRef.current) {
         return
       }
@@ -221,7 +309,7 @@ export function Editor() {
     }
 
     console.info('editor socket message', payload)
-  }, [])
+  }, [appendActivity, isCorrectionEnabled])
 
   const { status, sendMessage, sendRewriteRequest } = useEditorSocket({
     onMessage: handleSocketMessage,
@@ -272,7 +360,7 @@ export function Editor() {
         window.clearTimeout(correctionTimerRef.current)
       }
 
-      if (!text.trim() || text === lastCorrectionTextRef.current) {
+      if (!isCorrectionEnabled || !text.trim() || text === lastCorrectionTextRef.current) {
         return
       }
 
@@ -289,7 +377,7 @@ export function Editor() {
         }
       }, CORRECTION_DEBOUNCE_MS)
     },
-    [sendMessage],
+    [isCorrectionEnabled, sendMessage],
   )
 
   const handleGhostDismiss = useCallback(() => {
@@ -348,6 +436,22 @@ export function Editor() {
     },
     [handleGhostDismiss],
   )
+
+  const handleCorrectionToggle = useCallback((enabled: boolean) => {
+    setIsCorrectionEnabled(enabled)
+
+    if (enabled) {
+      return
+    }
+
+    if (correctionTimerRef.current !== null) {
+      window.clearTimeout(correctionTimerRef.current)
+      correctionTimerRef.current = null
+    }
+
+    latestCorrectionRequestIdRef.current = null
+    setCorrectionSuggestions([])
+  }, [])
 
   const flushPendingEdit = useCallback(() => {
     const pendingEdit = pendingEditRef.current
@@ -446,82 +550,118 @@ export function Editor() {
 
   return (
     <main className="editor-shell">
-      <header className="editor-header">
-        <div>
-          <p className="eyebrow">Phase 5</p>
-          <h1>Realtime Editor</h1>
-        </div>
-        <span className={`socket-pill socket-pill-${status}`}>{status}</span>
-      </header>
-
-      <div className="feature-toggles" aria-label="Editor features">
-        <label className="feature-toggle">
-          <input
-            type="checkbox"
-            checked={isAutocompleteEnabled}
-            onChange={(event) => handleAutocompleteToggle(event.target.checked)}
-          />
-          <span>Autocomplete</span>
-        </label>
-        <label className="feature-toggle">
-          <input
-            type="checkbox"
-            checked={isRewriteEnabled}
-            onChange={(event) => setIsRewriteEnabled(event.target.checked)}
-          />
-          <span>Rewrite toolbar</span>
-        </label>
-      </div>
-
       <LexicalComposer initialConfig={initialConfig}>
-        <section className="editor-frame">
-          <PlainTextPlugin
-            contentEditable={
-              <ContentEditable
-                className="editor-input"
-                aria-label="Realtime editor"
-                spellCheck
+        <section className="editor-workspace" aria-label="Realtime editor workspace">
+          <div className="editor-card">
+            <div className="editor-toolbar" aria-label="Editor controls">
+              <div className="toolbar-status-group">
+                <span className={`status-dot status-dot-${status}`} aria-hidden="true" />
+                <span className="toolbar-status-label">{status}</span>
+                <span className="toolbar-divider" aria-hidden="true" />
+                <span className="toolbar-meta">{documentStats.words} words</span>
+                <span className="toolbar-meta">{documentStats.characters} chars</span>
+              </div>
+
+              <div className="toolbar-control-group">
+                <label className="feature-switch">
+                  <input
+                    type="checkbox"
+                    checked={isAutocompleteEnabled}
+                    onChange={(event) => handleAutocompleteToggle(event.target.checked)}
+                  />
+                  <span>Autocomplete</span>
+                </label>
+                <label className="feature-switch">
+                  <input
+                    type="checkbox"
+                    checked={isCorrectionEnabled}
+                    onChange={(event) => handleCorrectionToggle(event.target.checked)}
+                  />
+                  <span>Corrections</span>
+                </label>
+                <label className="feature-switch">
+                  <input
+                    type="checkbox"
+                    checked={isRewriteEnabled}
+                    onChange={(event) => setIsRewriteEnabled(event.target.checked)}
+                  />
+                  <span>Rewrite</span>
+                </label>
+              </div>
+            </div>
+
+            <div className="editor-canvas">
+              <PlainTextPlugin
+                contentEditable={
+                  <ContentEditable
+                    className="editor-input"
+                    aria-label="Realtime editor"
+                    spellCheck
+                  />
+                }
+                placeholder={null}
+                ErrorBoundary={LexicalErrorBoundary}
               />
-            }
-            placeholder={
-              <div className="editor-placeholder">Start typing to sync with FastAPI...</div>
-            }
-            ErrorBoundary={LexicalErrorBoundary}
-          />
-          <HistoryPlugin />
-          <AutocompletePlugin
-            enabled={isAutocompleteEnabled}
-            onUserDismiss={handleGhostDismiss}
-            tokenChunk={tokenChunk}
-          />
-          <CorrectionSuggestionsPlugin
-            suggestions={correctionSuggestions}
-            onAccept={handleCorrectionAccept}
-            onDismiss={handleCorrectionDismiss}
-          />
-          {isRewriteEnabled ? (
-            <FloatingToolbarPlugin
-              onRewriteRequest={handleRewriteRequest}
-              rewriteChunks={rewriteChunks}
-              rewriteDoneId={rewriteDoneId}
-            />
-          ) : null}
+              <HistoryPlugin />
+              <AutocompletePlugin
+                enabled={isAutocompleteEnabled}
+                onUserDismiss={handleGhostDismiss}
+                tokenChunk={tokenChunk}
+              />
+              {isCorrectionEnabled ? (
+                <CorrectionSuggestionsPlugin
+                  suggestions={correctionSuggestions}
+                  onAccept={handleCorrectionAccept}
+                  onDismiss={handleCorrectionDismiss}
+                />
+              ) : null}
+              {isRewriteEnabled ? (
+                <FloatingToolbarPlugin
+                  onRewriteRequest={handleRewriteRequest}
+                  rewriteChunks={rewriteChunks}
+                  rewriteDoneId={rewriteDoneId}
+                />
+              ) : null}
+            </div>
+
+            <div className="editor-status-grid" aria-label="Editor stats and logs">
+              <div className="status-card">
+                <span className="status-card-label">Server</span>
+                <strong>{status}</strong>
+              </div>
+              <div className="status-card">
+                <span className="status-card-label">Last event</span>
+                <strong>{lastMessage?.type ?? 'none'}</strong>
+              </div>
+              <div className="status-card">
+                <span className="status-card-label">Corrections</span>
+                <strong>{correctionSuggestions.length}</strong>
+              </div>
+              <div className="activity-card">
+                <div className="activity-card-header">
+                  <span className="status-card-label">Activity</span>
+                  <span>{activityLog.length}</span>
+                </div>
+                {activityLog.length > 0 ? (
+                  <ol className="activity-list">
+                    {activityLog.map((entry) => (
+                      <li key={entry.id}>
+                        <span>{entry.time}</span>
+                        <strong>{entry.label}</strong>
+                        <em>{entry.detail}</em>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="activity-empty">No server activity yet.</p>
+                )}
+              </div>
+            </div>
+          </div>
+
           <OnChangePlugin
             ignoreSelectionChange={false}
             onChange={(editorState) => {
-              if (suppressEditorSyncRef.current) {
-                if (debounceTimerRef.current !== null) {
-                  window.clearTimeout(debounceTimerRef.current)
-                  debounceTimerRef.current = null
-                }
-                if (autocompleteTimerRef.current !== null) {
-                  window.clearTimeout(autocompleteTimerRef.current)
-                  autocompleteTimerRef.current = null
-                }
-                pendingEditRef.current = null
-                return
-              }
-
               let shouldAutocomplete = false
               let shouldCorrect = false
               let text = ''
@@ -535,8 +675,24 @@ export function Editor() {
                 text = getGhostFreeTextContent($getRoot())
                 cursorCharIndex = getCursorCharacterIndex()
                 shouldAutocomplete = isAutocompleteEnabled && isCollapsedRange
-                shouldCorrect = isCollapsedRange && Boolean(text.trim())
+                shouldCorrect =
+                  isCorrectionEnabled && isCollapsedRange && Boolean(text.trim())
               })
+
+              setDocumentStats(getDocumentStats(text))
+
+              if (suppressEditorSyncRef.current) {
+                if (debounceTimerRef.current !== null) {
+                  window.clearTimeout(debounceTimerRef.current)
+                  debounceTimerRef.current = null
+                }
+                if (autocompleteTimerRef.current !== null) {
+                  window.clearTimeout(autocompleteTimerRef.current)
+                  autocompleteTimerRef.current = null
+                }
+                pendingEditRef.current = null
+                return
+              }
 
               if (!shouldAutocomplete) {
                 if (autocompleteTimerRef.current !== null) {
@@ -556,11 +712,6 @@ export function Editor() {
           />
         </section>
       </LexicalComposer>
-
-      <footer className="editor-footer">
-        <span>Last server event: {lastMessage?.type ?? 'none'}</span>
-        <span>{lastMessage?.chunk ?? ''}</span>
-      </footer>
     </main>
   )
 }
