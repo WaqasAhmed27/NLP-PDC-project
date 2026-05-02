@@ -9,6 +9,7 @@ non-GPU machines.
 from __future__ import annotations
 
 import os
+import hashlib
 import threading
 import time
 from dataclasses import dataclass
@@ -172,6 +173,11 @@ class TelemetryStats:
 
         self.accepted_tokens = accepted_tokens or 0
         self.draft_tokens = self.accepted_tokens + (rejected_tokens or 0)
+
+    def acceptance_summary(self) -> str:
+        if self.draft_tokens <= 0:
+            return "unavailable"
+        return f"{self.accepted_tokens}/{self.draft_tokens}"
 
     def log(self) -> None:
         ended_at = time.perf_counter()
@@ -447,7 +453,7 @@ class RealExLlamaEngine:
             self.llama_draft = self._load_model_bundle(
                 "LLAMA_REWRITE_DRAFT_MODEL_DIR",
                 llama_draft_model_dir,
-                load_tokenizer=False,
+                load_tokenizer=self.debug_speculative_rewrite,
                 cache_cls=self.rewrite_cache_cls,
                 cache_name="Q4 rewrite draft",
             )
@@ -487,6 +493,7 @@ class RealExLlamaEngine:
             self.rewrite_top_k,
             self.rewrite_repetition_penalty,
         )
+        self._log_speculative_startup_debug()
 
     def _load_model_bundle(
         self,
@@ -674,6 +681,12 @@ class RealExLlamaEngine:
             telemetry.log()
             return
         input_tensor = self.torch.tensor([input_ids], dtype=self.torch.long)
+        if self.debug_speculative_rewrite:
+            self._log_rewrite_request_debug(
+                prompt,
+                input_ids,
+                max_new_tokens,
+            )
 
         if not self.enable_speculative_rewrite:
             try:
@@ -781,10 +794,30 @@ class RealExLlamaEngine:
             self.rewrite_generator.enqueue(job)
 
         emitted_tokens = 0
+        emitted_text = ""
+        iteration = 0
+        empty_iterations = 0
         try:
             while not cancel_event.is_set():
+                iteration += 1
                 with self.gpu_lock, self.torch.inference_mode():
                     results = self.rewrite_generator.iterate()
+
+                if results:
+                    empty_iterations = 0
+                else:
+                    empty_iterations += 1
+
+                if self.debug_speculative_rewrite and (
+                    results or empty_iterations == 1 or empty_iterations % 100 == 0
+                ):
+                    print(
+                        "[HEAVY-PATH][spec] "
+                        f"iterate={iteration} results={len(results) if results else 0} "
+                        f"empty_iterations={empty_iterations} "
+                        f"job={self._job_debug_state(job)}",
+                        flush=True,
+                    )
 
                 if not results:
                     if self._job_is_complete(job):
@@ -792,14 +825,29 @@ class RealExLlamaEngine:
                         return
                     continue
 
-                for result in results:
+                for result_index, result in enumerate(results):
                     result_job = result.get("job")
                     if result_job is not None and result_job is not job:
+                        if self.debug_speculative_rewrite:
+                            print(
+                                "[HEAVY-PATH][spec] "
+                                f"iterate={iteration} result={result_index} skipped foreign job",
+                                flush=True,
+                            )
                         continue
 
                     telemetry.observe_speculative_result(result)
                     token_count = self._result_token_count(result)
-                    chunk = self._dynamic_result_chunk(result)
+                    chunk = self._dynamic_result_text_delta(result)
+                    if self.debug_speculative_rewrite:
+                        self._log_dynamic_result_debug(
+                            result,
+                            iteration,
+                            result_index,
+                            token_count,
+                            telemetry,
+                            emitted_text,
+                        )
                     if not chunk:
                         if result.get("eos", False):
                             self._log_rewrite_stop("eos", result)
@@ -810,6 +858,14 @@ class RealExLlamaEngine:
                     if trimmed_chunk:
                         telemetry.observe_chunk(trimmed_chunk, token_count)
                         emitted_tokens += token_count
+                        emitted_text += trimmed_chunk
+                        if self.debug_speculative_rewrite:
+                            print(
+                                "[HEAVY-PATH][spec] emit "
+                                f"tokens={emitted_tokens} chars={len(emitted_text)} "
+                                f"delta={trimmed_chunk!r}",
+                                flush=True,
+                            )
                         yield trimmed_chunk
                     if stop_string:
                         self._log_rewrite_stop(f"text stop {stop_string!r}", result)
@@ -824,20 +880,193 @@ class RealExLlamaEngine:
             if cancel_event.is_set() and hasattr(job, "cancel"):
                 self._log_rewrite_stop("cancelled")
                 job.cancel()
+            if self.debug_speculative_rewrite:
+                print(
+                    "[HEAVY-PATH][spec] final emitted "
+                    f"tokens={emitted_tokens} chars={len(emitted_text)} "
+                    f"text={emitted_text!r} job={self._job_debug_state(job)}",
+                    flush=True,
+                )
 
-    def _dynamic_result_chunk(self, result: dict[str, Any]) -> str:
+    def _dynamic_result_text_delta(self, result: dict[str, Any]) -> str:
         chunk = result.get("chunk")
         text = result.get("text")
-        if self.debug_speculative_rewrite:
-            keys = ",".join(sorted(str(key) for key in result.keys()))
-            chunk_preview = repr(str(chunk)[:80]) if chunk is not None else "None"
-            text_preview = repr(str(text)[:80]) if text is not None else "None"
+        return str(text if text is not None else chunk or "")
+
+    def _log_speculative_startup_debug(self) -> None:
+        if not self.debug_speculative_rewrite:
+            return
+        print(
+            "[HEAVY-PATH][spec] startup "
+            f"enabled={self.enable_speculative_rewrite} "
+            f"draft_tokens={self.speculative_draft_tokens} "
+            f"target={self.llama_target.model_dir} "
+            f"draft={self.llama_draft.model_dir if self.llama_draft else None}",
+            flush=True,
+        )
+        self._log_model_fingerprint("target", self.llama_target)
+        if self.llama_draft is not None:
+            self._log_model_fingerprint("draft", self.llama_draft)
+            self._log_tokenizer_file_comparison(self.llama_target, self.llama_draft)
+
+    def _log_rewrite_request_debug(
+        self,
+        prompt: str,
+        input_ids: list[int],
+        max_new_tokens: int,
+    ) -> None:
+        print(
+            "[HEAVY-PATH][spec] rewrite request "
+            f"prompt_chars={len(prompt)} prompt_tokens={len(input_ids)} "
+            f"max_new_tokens={max_new_tokens} "
+            f"temperature={self.rewrite_temperature} top_p={self.rewrite_top_p} "
+            f"top_k={self.rewrite_top_k} repetition_penalty={self.rewrite_repetition_penalty}",
+            flush=True,
+        )
+        print(
+            "[HEAVY-PATH][spec] prompt preview "
+            f"{prompt[:500]!r}",
+            flush=True,
+        )
+
+    def _log_model_fingerprint(self, label: str, bundle: ModelBundle) -> None:
+        config = bundle.config
+        tokenizer = bundle.tokenizer
+        print(
+            "[HEAVY-PATH][spec] model "
+            f"{label} dir={bundle.model_dir} "
+            f"vocab_size={getattr(config, 'vocab_size', None)} "
+            f"bos={getattr(config, 'bos_token_id', None)} "
+            f"eos={getattr(config, 'eos_token_id', None)} "
+            f"tokenizer_eos={getattr(tokenizer, 'eos_token_id', None) if tokenizer else None} "
+            f"tokenizer_hash={self._model_file_hash(bundle.model_dir, 'tokenizer.json')} "
+            f"tokenizer_config_hash={self._model_file_hash(bundle.model_dir, 'tokenizer_config.json')}",
+            flush=True,
+        )
+
+    def _log_tokenizer_file_comparison(
+        self,
+        target: ModelBundle,
+        draft: ModelBundle,
+    ) -> None:
+        for filename in ("tokenizer.json", "tokenizer_config.json", "config.json"):
+            target_hash = self._model_file_hash(target.model_dir, filename)
+            draft_hash = self._model_file_hash(draft.model_dir, filename)
             print(
-                "[HEAVY-PATH] Dynamic result "
-                f"keys={keys} chunk={chunk_preview} text={text_preview}",
+                "[HEAVY-PATH][spec] file compare "
+                f"{filename} target={target_hash} draft={draft_hash} "
+                f"match={target_hash == draft_hash and target_hash != 'missing'}",
                 flush=True,
             )
-        return str(chunk if chunk is not None else text or "")
+
+    def _model_file_hash(self, model_dir: str, filename: str) -> str:
+        path = Path(model_dir) / filename
+        if not path.exists():
+            return "missing"
+        digest = hashlib.sha256()
+        with path.open("rb") as file:
+            for block in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()[:16]
+
+    def _log_dynamic_result_debug(
+        self,
+        result: dict[str, Any],
+        iteration: int,
+        result_index: int,
+        token_count: int,
+        telemetry: TelemetryStats,
+        emitted_text: str,
+    ) -> None:
+        keys = ",".join(sorted(str(key) for key in result.keys()))
+        text = result.get("text")
+        chunk = result.get("chunk")
+        print(
+            "[HEAVY-PATH][spec] result "
+            f"iterate={iteration} index={result_index} keys={keys} "
+            f"eos={result.get('eos', None)} token_count={token_count} "
+            f"acceptance={telemetry.acceptance_summary()} "
+            f"text={self._preview_debug_value(text)} "
+            f"chunk={self._preview_debug_value(chunk)} "
+            f"tokens={self._result_tokens_debug(result)} "
+            f"draft={self._result_draft_debug(result)} "
+            f"emitted_tail={emitted_text[-120:]!r}",
+            flush=True,
+        )
+
+    def _result_tokens_debug(self, result: dict[str, Any]) -> str:
+        parts = []
+        for key in (
+            "token",
+            "token_id",
+            "tokens",
+            "token_ids",
+            "ids",
+            "new_token_ids",
+            "generated_token_ids",
+        ):
+            if key in result:
+                parts.append(f"{key}={self._preview_debug_value(result[key])}")
+        return "; ".join(parts) or "unavailable"
+
+    def _result_draft_debug(self, result: dict[str, Any]) -> str:
+        parts = []
+        for key in (
+            "draft_tokens",
+            "num_draft_tokens",
+            "drafted_tokens",
+            "attempted_draft_tokens",
+            "accepted_tokens",
+            "num_accepted_tokens",
+            "accepted_draft_tokens",
+            "draft_tokens_accepted",
+            "rejected_tokens",
+            "rejected_draft_tokens",
+            "draft_token_ids",
+            "draft_ids",
+            "draft_text",
+        ):
+            if key in result:
+                parts.append(f"{key}={self._preview_debug_value(result[key])}")
+        if parts:
+            return "; ".join(parts)
+        return "raw draft proposal not exposed by result"
+
+    def _preview_debug_value(self, value: Any, limit: int = 160) -> str:
+        if value is None:
+            return "None"
+        if hasattr(value, "tolist"):
+            try:
+                value = value.tolist()
+            except Exception:
+                pass
+        rendered = repr(value)
+        if len(rendered) > limit:
+            rendered = f"{rendered[:limit]}..."
+        return rendered
+
+    def _job_debug_state(self, job: Any) -> str:
+        parts = []
+        for attr_name in (
+            "eos",
+            "finished",
+            "done",
+            "completed",
+            "max_new_tokens",
+            "new_tokens",
+            "generated_tokens",
+            "accepted_draft_tokens",
+            "rejected_draft_tokens",
+        ):
+            if hasattr(job, attr_name):
+                value = getattr(job, attr_name)
+                if callable(value):
+                    try:
+                        value = value()
+                    except TypeError:
+                        value = "<callable>"
+                parts.append(f"{attr_name}={value!r}")
+        return " ".join(parts) or "unavailable"
 
     def _job_is_complete(self, job: Any) -> bool:
         for attr_name in ("eos", "finished", "done", "completed", "is_complete"):
