@@ -1106,6 +1106,12 @@ class RealExLlamaEngine:
             )
             if token_id is not None:
                 details = f" token={token_id!r}"
+            eos_reason = result.get("eos_reason")
+            if eos_reason is not None:
+                details += f" eos_reason={eos_reason!r}"
+            full_completion = result.get("full_completion")
+            if full_completion is not None:
+                details += f" full_completion={self._preview_debug_value(full_completion, 240)}"
         print(f"[HEAVY-PATH] Stop reason: {reason}{details}", flush=True)
 
     def _rewrite_stop_conditions(self) -> list[Any]:
@@ -1120,6 +1126,22 @@ class RealExLlamaEngine:
         return stop_conditions
 
     def _result_token_count(self, result: dict[str, Any]) -> int:
+        token_ids = _first_present_value(
+            result,
+            ("token_ids", "tokens_ids", "ids", "token"),
+        )
+        if hasattr(token_ids, "numel"):
+            return int(token_ids.numel())
+        if isinstance(token_ids, (list, tuple)):
+            if (
+                len(token_ids) == 1
+                and isinstance(token_ids[0], (list, tuple))
+            ):
+                return max(1, len(token_ids[0]))
+            return max(1, len(token_ids))
+        if isinstance(token_ids, int):
+            return 1
+
         explicit_count = _first_int_value(
             result,
             (
@@ -1132,17 +1154,6 @@ class RealExLlamaEngine:
         )
         if explicit_count is not None and explicit_count > 0:
             return explicit_count
-
-        token_ids = _first_present_value(
-            result,
-            ("token_ids", "tokens_ids", "ids", "token"),
-        )
-        if hasattr(token_ids, "numel"):
-            return int(token_ids.numel())
-        if isinstance(token_ids, (list, tuple)):
-            return max(1, len(token_ids))
-        if isinstance(token_ids, int):
-            return 1
 
         return 1
 

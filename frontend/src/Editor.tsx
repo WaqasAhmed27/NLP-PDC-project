@@ -150,7 +150,7 @@ export function Editor() {
   const rewriteDoneIdRef = useRef(0)
   const [lastMessage, setLastMessage] = useState<IncomingEditorMessage | null>(null)
   const [tokenChunk, setTokenChunk] = useState<TokenChunkEvent | null>(null)
-  const [rewriteChunk, setRewriteChunk] = useState<TokenChunkEvent | null>(null)
+  const [rewriteChunks, setRewriteChunks] = useState<TokenChunkEvent[]>([])
   const [rewriteDoneId, setRewriteDoneId] = useState(0)
   const [isAutocompleteEnabled, setIsAutocompleteEnabled] = useState(true)
   const [isRewriteEnabled, setIsRewriteEnabled] = useState(true)
@@ -161,10 +161,11 @@ export function Editor() {
     if (payload.request_id === activeRewriteRequestIdRef.current) {
       if (payload.type === 'token' && payload.chunk) {
         rewriteChunkIdRef.current += 1
-        setRewriteChunk({
+        const rewriteChunk = {
           id: rewriteChunkIdRef.current,
           chunk: payload.chunk,
-        })
+        }
+        setRewriteChunks((chunks) => [...chunks, rewriteChunk])
       }
 
       if (
@@ -258,7 +259,7 @@ export function Editor() {
           autocompleteTimerRef.current = null
         }
         setTokenChunk(null)
-        setRewriteChunk(null)
+        setRewriteChunks([])
       }
 
       return requestId
@@ -409,7 +410,7 @@ export function Editor() {
           {isRewriteEnabled ? (
             <FloatingToolbarPlugin
               onRewriteRequest={handleRewriteRequest}
-              rewriteChunk={rewriteChunk}
+              rewriteChunks={rewriteChunks}
               rewriteDoneId={rewriteDoneId}
             />
           ) : null}

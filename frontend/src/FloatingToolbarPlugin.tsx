@@ -28,7 +28,7 @@ type FloatingToolbarPluginProps = {
     highlightedText: string,
     instruction: string,
   ) => string | null
-  rewriteChunk: RewriteChunkEvent | null
+  rewriteChunks: RewriteChunkEvent[]
   rewriteDoneId: number
 }
 
@@ -64,7 +64,7 @@ function clearEditorSelection(editor: LexicalEditor) {
 
 export function FloatingToolbarPlugin({
   onRewriteRequest,
-  rewriteChunk,
+  rewriteChunks,
   rewriteDoneId,
 }: FloatingToolbarPluginProps) {
   const [editor] = useLexicalComposerContext()
@@ -73,6 +73,7 @@ export function FloatingToolbarPlugin({
   const [position, setPosition] = useState<ToolbarPosition | null>(null)
   const isRewritingRef = useRef(false)
   const rewriteTextRef = useRef('')
+  const lastProcessedRewriteChunkIdRef = useRef(0)
   const storedSelectionRef = useRef<RangeSelection | null>(null)
   const rewriteNodeKeyRef = useRef<NodeKey | null>(null)
 
@@ -175,6 +176,7 @@ export function FloatingToolbarPlugin({
     storedSelectionRef.current = clonedSelection
     rewriteNodeKeyRef.current = null
     rewriteTextRef.current = ''
+    lastProcessedRewriteChunkIdRef.current = 0
     isRewritingRef.current = true
     setPosition(null)
   }, [editor, instruction, onRewriteRequest])
@@ -184,19 +186,32 @@ export function FloatingToolbarPlugin({
     setPosition(null)
     isRewritingRef.current = false
     rewriteTextRef.current = ''
+    lastProcessedRewriteChunkIdRef.current = 0
     storedSelectionRef.current = null
     rewriteNodeKeyRef.current = null
     clearEditorSelection(editor)
   }, [editor])
 
   useEffect(() => {
-    if (!rewriteChunk || !isRewritingRef.current) {
+    if (!isRewritingRef.current || rewriteChunks.length === 0) {
       return
     }
 
-    rewriteTextRef.current += rewriteChunk.chunk
+    const pendingChunks = rewriteChunks.filter(
+      (chunk) => chunk.id > lastProcessedRewriteChunkIdRef.current,
+    )
+
+    if (pendingChunks.length === 0) {
+      return
+    }
+
+    for (const chunk of pendingChunks) {
+      rewriteTextRef.current += chunk.chunk
+      lastProcessedRewriteChunkIdRef.current = chunk.id
+    }
+
     replaceStoredSelection(rewriteTextRef.current)
-  }, [replaceStoredSelection, rewriteChunk])
+  }, [replaceStoredSelection, rewriteChunks])
 
   useEffect(() => {
     if (!isRewritingRef.current || rewriteDoneId === 0) {
@@ -206,6 +221,7 @@ export function FloatingToolbarPlugin({
     replaceStoredSelection(rewriteTextRef.current, true)
     isRewritingRef.current = false
     rewriteTextRef.current = ''
+    lastProcessedRewriteChunkIdRef.current = 0
     storedSelectionRef.current = null
     rewriteNodeKeyRef.current = null
   }, [replaceStoredSelection, rewriteDoneId])
