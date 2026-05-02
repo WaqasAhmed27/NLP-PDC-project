@@ -32,14 +32,24 @@
     "task": "autocomplete",
     "name": "Autocomplete at paragraph end",
     "document_text": "The research team evaluated the deployment risks and concluded that the safest next step was",
-    "cursor": 88
+    "cursor": 88,
+    "reference_completions": [
+      "to pause the rollout.",
+      "to delay the rollout.",
+      "to proceed cautiously."
+    ]
   },
   {
     "id": "autocomplete_mid_sentence",
     "task": "autocomplete",
     "name": "Autocomplete mid sentence",
     "document_text": "The committee approved the revised policy because  would reduce operational uncertainty for regional teams.",
-    "cursor": 47
+    "cursor": 47,
+    "reference_completions": [
+      "it",
+      "the change",
+      "the update"
+    ]
   },
   {
     "id": "correction_typos_grammar",

@@ -1,6 +1,7 @@
 {
   "repetitions": 1,
   "draft_modes": ["target_only", "draft_1b", "draft_3b"],
+  "fast_path_modes": ["llama_instruct", "qwen_fim", "granite_fim"],
   "speculative_draft_tokens": [1, 2, 3, 4],
   "rewrite": {
     "temperature": [0.2],

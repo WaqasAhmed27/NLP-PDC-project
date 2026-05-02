@@ -45,6 +45,7 @@ if str(REPO_ROOT) not in sys.path:
 DEFAULT_CONFIG: dict[str, Any] = {
     "repetitions": 1,
     "draft_modes": ["target_only", "draft_1b", "draft_3b"],
+    "fast_path_modes": ["llama_instruct", "qwen_fim", "granite_fim"],
     "speculative_draft_tokens": [1, 2, 3, 4],
     "rewrite": {
         "temperature": [0.2],
@@ -101,6 +102,23 @@ DEFAULT_SCENARIOS: list[dict[str, Any]] = [
         "name": "Autocomplete at paragraph end",
         "document_text": "The research team evaluated the deployment risks and concluded that the safest next step was",
         "cursor": 88,
+        "reference_completions": [
+            "to pause the rollout.",
+            "to delay the rollout.",
+            "to proceed cautiously.",
+        ],
+    },
+    {
+        "id": "autocomplete_mid_sentence",
+        "task": "autocomplete",
+        "name": "Autocomplete mid sentence",
+        "document_text": "The committee approved the revised policy because  would reduce operational uncertainty for regional teams.",
+        "cursor": 47,
+        "reference_completions": [
+            "it",
+            "the change",
+            "the update",
+        ],
     },
     {
         "id": "correction_typos_grammar",
@@ -122,6 +140,8 @@ CSV_FIELDS = [
     "target_model",
     "draft_model_label",
     "draft_model_path",
+    "fast_path_mode",
+    "fast_path_model_path",
     "fast_model",
     "speculative_enabled",
     "speculative_draft_tokens",
@@ -149,6 +169,7 @@ CSV_FIELDS = [
     "missing_word_suspected",
     "malformed_json",
     "quality_flags",
+    "quality_score",
     "output_preview",
     "raw_output",
 ]
@@ -165,6 +186,17 @@ SUMMARY_FIELDS = [
     "avg_tps",
     "avg_acceptance_rate",
     "quality_flag_rate",
+    "avg_quality_score",
+]
+
+QUALITY_COMPARISON_FIELDS = [
+    "task",
+    "scenario_id",
+    "baseline_label",
+    "candidate_label",
+    "baseline_quality",
+    "candidate_quality",
+    "quality_delta",
 ]
 
 TELEMETRY_RE = re.compile(
@@ -184,6 +216,8 @@ class BenchmarkCase:
     repetition: int
     draft_model_label: str
     draft_model_path: str
+    fast_path_mode: str
+    fast_path_model_path: str
     speculative_enabled: bool
     speculative_draft_tokens: int | None
     temperature: float
@@ -243,6 +277,10 @@ def number_or_empty(value: Any) -> Any:
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", normalize_text(text).lower())
 
 
 def preview(text: str, limit: int = 220) -> str:
@@ -347,11 +385,62 @@ def quality_flags(task: str, output: str, error: str) -> dict[str, bool]:
     }
 
 
+def token_f1(reference: str, candidate: str) -> float:
+    reference_tokens = normalize_tokens(reference)
+    candidate_tokens = normalize_tokens(candidate)
+    if not reference_tokens or not candidate_tokens:
+        return 0.0
+
+    reference_counts: dict[str, int] = {}
+    candidate_counts: dict[str, int] = {}
+    for token in reference_tokens:
+        reference_counts[token] = reference_counts.get(token, 0) + 1
+    for token in candidate_tokens:
+        candidate_counts[token] = candidate_counts.get(token, 0) + 1
+
+    overlap = 0
+    for token, count in candidate_counts.items():
+        overlap += min(count, reference_counts.get(token, 0))
+    if overlap <= 0:
+        return 0.0
+
+    precision = overlap / len(candidate_tokens)
+    recall = overlap / len(reference_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def quality_score(
+    case: BenchmarkCase,
+    output: str,
+    error: str,
+    flags: dict[str, bool],
+) -> float | None:
+    if error:
+        return 0.0
+    if flags["empty_output"] or flags["role_leak"] or flags["code_leak"]:
+        return 0.0
+
+    references = case.scenario.get("reference_completions")
+    if case.task == "autocomplete" and isinstance(references, list) and references:
+        best = max(token_f1(str(reference), output) for reference in references)
+        if flags["missing_word_suspected"]:
+            best *= 0.8
+        return round(best, 4)
+
+    return None
+
+
 def build_env_for_case(args: argparse.Namespace, case: BenchmarkCase) -> dict[str, str]:
     env = {
         "USE_MOCK_ENGINE": "true" if args.mock else "false",
-        "FAST_PATH_MODE": "llama_instruct",
+        "FAST_PATH_MODE": case.fast_path_mode,
         "LLAMA_FAST_MODEL_DIR": args.fast_model or os.getenv("LLAMA_FAST_MODEL_DIR", ""),
+        "QWEN_AUTOCOMPLETE_MODEL_DIR": args.qwen_model
+        or os.getenv("QWEN_AUTOCOMPLETE_MODEL_DIR", ""),
+        "GRANITE_FIM_MODEL_DIR": args.granite_fim_model
+        or os.getenv("GRANITE_FIM_MODEL_DIR", ""),
         "LLAMA_REWRITE_TARGET_MODEL_DIR": args.target_model
         or os.getenv("LLAMA_REWRITE_TARGET_MODEL_DIR", ""),
         "GENERATION_TEMPERATURE": str(case.temperature),
@@ -383,10 +472,18 @@ def expand_cases(
     repetitions = args.repetitions if args.repetitions is not None else int(config["repetitions"])
     allowed_tasks = set(args.tasks.split(",")) if args.tasks else None
     allowed_draft_modes = set(args.draft_modes.split(",")) if args.draft_modes else None
+    allowed_fast_path_modes = (
+        set(args.fast_path_modes.split(",")) if args.fast_path_modes else None
+    )
     draft_modes = [
         mode
         for mode in config.get("draft_modes", DEFAULT_CONFIG["draft_modes"])
         if allowed_draft_modes is None or mode in allowed_draft_modes
+    ]
+    fast_path_modes = [
+        mode
+        for mode in config.get("fast_path_modes", DEFAULT_CONFIG["fast_path_modes"])
+        if allowed_fast_path_modes is None or mode in allowed_fast_path_modes
     ]
     draft_token_values = [int(value) for value in ensure_list(config["speculative_draft_tokens"])]
     cases: list[BenchmarkCase] = []
@@ -412,7 +509,7 @@ def expand_cases(
         if task == "rewrite":
             mode_values = draft_modes
         else:
-            mode_values = ["fast_path"]
+            mode_values = fast_path_modes if task == "autocomplete" else ["llama_instruct"]
 
         for repetition in range(1, repetitions + 1):
             for mode in mode_values:
@@ -439,6 +536,26 @@ def expand_cases(
                         )
                     else:
                         draft_path = ""
+                    if task == "autocomplete":
+                        fast_path_mode = mode
+                    else:
+                        fast_path_mode = "llama_instruct"
+
+                    if fast_path_mode == "qwen_fim":
+                        fast_path_model_path = args.qwen_model or os.getenv(
+                            "QWEN_AUTOCOMPLETE_MODEL_DIR",
+                            "",
+                        )
+                    elif fast_path_mode == "granite_fim":
+                        fast_path_model_path = args.granite_fim_model or os.getenv(
+                            "GRANITE_FIM_MODEL_DIR",
+                            "",
+                        )
+                    else:
+                        fast_path_model_path = args.fast_model or os.getenv(
+                            "LLAMA_FAST_MODEL_DIR",
+                            "",
+                        )
                     cases.append(
                         BenchmarkCase(
                             task=task,
@@ -446,6 +563,8 @@ def expand_cases(
                             repetition=repetition,
                             draft_model_label=mode,
                             draft_model_path=draft_path,
+                            fast_path_mode=fast_path_mode,
+                            fast_path_model_path=fast_path_model_path,
                             speculative_enabled=mode in {"draft_1b", "draft_3b"},
                             speculative_draft_tokens=draft_tokens,
                             temperature=temp,
@@ -474,6 +593,7 @@ def prompt_info(engine: Any, case: BenchmarkCase) -> tuple[int | None, int | Non
         from engine import (
             build_llama_autocomplete_prompt,
             build_llama_correction_prompt,
+            build_qwen_fim_prompt,
             build_llama_rewrite_prompt,
         )
 
@@ -485,8 +605,13 @@ def prompt_info(engine: Any, case: BenchmarkCase) -> tuple[int | None, int | Non
             tokenizer = getattr(getattr(engine, "llama_target", None), "tokenizer", None)
         elif case.task == "autocomplete":
             text = str(case.scenario["document_text"])
-            prompt = build_llama_autocomplete_prompt(text, resolve_cursor(case.scenario))
-            tokenizer = getattr(getattr(engine, "fast_llama", None), "tokenizer", None)
+            if case.fast_path_mode in {"qwen_fim", "granite_fim"}:
+                prompt = build_qwen_fim_prompt(text, resolve_cursor(case.scenario))
+                tokenizer_attr = "qwen" if case.fast_path_mode == "qwen_fim" else "granite_fim"
+                tokenizer = getattr(getattr(engine, tokenizer_attr, None), "tokenizer", None)
+            else:
+                prompt = build_llama_autocomplete_prompt(text, resolve_cursor(case.scenario))
+                tokenizer = getattr(getattr(engine, "fast_llama", None), "tokenizer", None)
         else:
             text = str(case.scenario["document_text"])
             prompt, _, _ = build_llama_correction_prompt(text, resolve_cursor(case.scenario))
@@ -559,6 +684,7 @@ def run_case(args: argparse.Namespace, case: BenchmarkCase) -> tuple[dict[str, A
     telemetry = parse_telemetry(captured_logs)
     flags = quality_flags(case.task, output, error)
     quality_flag_names = [name for name, enabled in flags.items() if enabled]
+    score = quality_score(case, output, error, flags)
 
     row = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -571,6 +697,8 @@ def run_case(args: argparse.Namespace, case: BenchmarkCase) -> tuple[dict[str, A
         "target_model": env.get("LLAMA_REWRITE_TARGET_MODEL_DIR", ""),
         "draft_model_label": case.draft_model_label,
         "draft_model_path": case.draft_model_path,
+        "fast_path_mode": case.fast_path_mode,
+        "fast_path_model_path": case.fast_path_model_path,
         "fast_model": env.get("LLAMA_FAST_MODEL_DIR", ""),
         "speculative_enabled": bool_csv(case.speculative_enabled),
         "speculative_draft_tokens": number_or_empty(case.speculative_draft_tokens),
@@ -598,6 +726,7 @@ def run_case(args: argparse.Namespace, case: BenchmarkCase) -> tuple[dict[str, A
         "missing_word_suspected": bool_csv(flags["missing_word_suspected"]),
         "malformed_json": bool_csv(flags["malformed_json"]),
         "quality_flags": "|".join(quality_flag_names) if quality_flag_names else "none",
+        "quality_score": number_or_empty(score),
         "output_preview": preview(output),
         "raw_output": output if args.raw_output else "",
     }
@@ -646,10 +775,11 @@ def grouped_summary(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
             for row in group_rows
             if row.get("quality_flags") not in ("", "none", None)
         )
-        avg_ttft = mean(row["ttft_ms"] for row in group_rows)
-        avg_total = mean(row["total_ms"] for row in group_rows)
-        avg_tps = mean(row["tokens_per_second"] for row in group_rows)
-        avg_acceptance = mean(row["draft_acceptance_rate"] for row in group_rows)
+        avg_ttft = mean(row.get("ttft_ms") for row in group_rows)
+        avg_total = mean(row.get("total_ms") for row in group_rows)
+        avg_tps = mean(row.get("tokens_per_second") for row in group_rows)
+        avg_acceptance = mean(row.get("draft_acceptance_rate") for row in group_rows)
+        avg_quality = mean(row.get("quality_score") for row in group_rows)
         summary_rows.append(
             {
                 "task": task,
@@ -663,6 +793,7 @@ def grouped_summary(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "avg_tps": number_or_empty(round(avg_tps, 3) if avg_tps is not None else None),
                 "avg_acceptance_rate": number_or_empty(round(avg_acceptance, 4) if avg_acceptance is not None else None),
                 "quality_flag_rate": round(flagged / len(group_rows), 4) if group_rows else 0,
+                "avg_quality_score": number_or_empty(round(avg_quality, 4) if avg_quality is not None else None),
             }
         )
     return summary_rows
@@ -782,6 +913,13 @@ def generate_plots(results_csv: Path, output_dir: Path) -> list[Path]:
             "output_tokens",
             ("task", "scenario_id"),
         ),
+        (
+            "quality_score_by_model.png",
+            "Average Quality Score by Model Mode",
+            "Quality score",
+            "quality_score",
+            ("task", "draft_model_label"),
+        ),
     ]
 
     for filename, title, ylabel, metric, label_keys in plot_specs:
@@ -831,8 +969,9 @@ def write_summary_md(path: Path, rows: list[dict[str, str]], summary_rows: list[
     total = len(rows)
     errors = sum(1 for row in rows if row.get("error"))
     flagged = sum(1 for row in rows if row.get("quality_flags") not in ("", "none", None))
-    avg_total = mean(row["total_ms"] for row in rows)
-    avg_ttft = mean(row["ttft_ms"] for row in rows)
+    avg_total = mean(row.get("total_ms") for row in rows)
+    avg_ttft = mean(row.get("ttft_ms") for row in rows)
+    avg_quality = mean(row.get("quality_score") for row in rows)
     lines = [
         "# Benchmark Summary",
         "",
@@ -841,6 +980,7 @@ def write_summary_md(path: Path, rows: list[dict[str, str]], summary_rows: list[
         f"- Runs with quality flags: {flagged}",
         f"- Average TTFT ms: {avg_ttft:.2f}" if avg_ttft is not None else "- Average TTFT ms: unavailable",
         f"- Average total ms: {avg_total:.2f}" if avg_total is not None else "- Average total ms: unavailable",
+        f"- Average quality score: {avg_quality:.3f}" if avg_quality is not None else "- Average quality score: unavailable",
         "",
         "## Generated Files",
         "",
@@ -860,9 +1000,109 @@ def write_summary_md(path: Path, rows: list[dict[str, str]], summary_rows: list[
         lines.append(
             "- "
             f"{summary['task']} | {summary['scenario_id']} | {summary['draft_model_label']} | "
-            f"runs={summary['runs']} errors={summary['errors']} avg_total_ms={summary['avg_total_ms']}"
+            f"runs={summary['runs']} errors={summary['errors']} "
+            f"avg_total_ms={summary['avg_total_ms']} avg_quality={summary['avg_quality_score']}"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def quality_label_for_row(row: dict[str, str]) -> str:
+    if row.get("task") == "autocomplete":
+        return str(row.get("fast_path_mode", ""))
+    return str(row.get("draft_model_label", ""))
+
+
+def compare_quality_against_baseline(
+    rows: list[dict[str, str]],
+    baseline_label: str,
+    candidate_label: str,
+) -> list[dict[str, Any]]:
+    by_group: dict[tuple[str, str], dict[str, list[float]]] = {}
+    for row in rows:
+        label = quality_label_for_row(row)
+        if label not in {baseline_label, candidate_label}:
+            continue
+        score = safe_float(row.get("quality_score"))
+        if score is None:
+            continue
+        key = (str(row.get("task", "")), str(row.get("scenario_id", "")))
+        group = by_group.setdefault(key, {baseline_label: [], candidate_label: []})
+        group[label].append(score)
+
+    comparisons: list[dict[str, Any]] = []
+    for (task, scenario_id), grouped_scores in sorted(by_group.items()):
+        baseline_mean = mean(grouped_scores.get(baseline_label, []))
+        candidate_mean = mean(grouped_scores.get(candidate_label, []))
+        if baseline_mean is None or candidate_mean is None:
+            continue
+        comparisons.append(
+            {
+                "task": task,
+                "scenario_id": scenario_id,
+                "baseline_label": baseline_label,
+                "candidate_label": candidate_label,
+                "baseline_quality": round(baseline_mean, 4),
+                "candidate_quality": round(candidate_mean, 4),
+                "quality_delta": round(candidate_mean - baseline_mean, 4),
+            }
+        )
+    return comparisons
+
+
+def write_quality_comparison_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=QUALITY_COMPARISON_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_quality_comparison_md(path: Path, rows: list[dict[str, Any]]) -> None:
+    lines = [
+        "# Quality Comparison",
+        "",
+    ]
+    if not rows:
+        lines.extend(
+            [
+                "- No comparable rows were found.",
+                "- Ensure both baseline and candidate labels exist in `results.csv` with non-empty quality scores.",
+            ]
+        )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+
+    avg_delta = mean(row["quality_delta"] for row in rows)
+    lines.extend(
+        [
+            f"- Scenarios compared: {len(rows)}",
+            (
+                f"- Average quality delta (candidate - baseline): {avg_delta:.4f}"
+                if avg_delta is not None
+                else "- Average quality delta (candidate - baseline): unavailable"
+            ),
+            "",
+            "| task | scenario_id | baseline | candidate | baseline_quality | candidate_quality | delta |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: |",
+        ]
+    )
+    for row in rows:
+        lines.append(
+            f"| {row['task']} | {row['scenario_id']} | {row['baseline_label']} | "
+            f"{row['candidate_label']} | {row['baseline_quality']} | "
+            f"{row['candidate_quality']} | {row['quality_delta']} |"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def maybe_write_quality_comparison(
+    output_dir: Path,
+    rows: list[dict[str, str]],
+    baseline_label: str,
+    candidate_label: str,
+) -> None:
+    comparisons = compare_quality_against_baseline(rows, baseline_label, candidate_label)
+    write_quality_comparison_csv(output_dir / "quality_comparison.csv", comparisons)
+    write_quality_comparison_md(output_dir / "quality_comparison.md", comparisons)
 
 
 def write_run_config(path: Path, args: argparse.Namespace, config: dict[str, Any], scenarios: list[dict[str, Any]], cases: list[BenchmarkCase]) -> None:
@@ -876,6 +1116,10 @@ def write_run_config(path: Path, args: argparse.Namespace, config: dict[str, Any
         "draft_1b_model": args.draft_1b_model or os.getenv("LLAMA_REWRITE_DRAFT_MODEL_DIR", ""),
         "draft_3b_model": args.draft_3b_model or args.fast_model or os.getenv("LLAMA_FAST_MODEL_DIR", ""),
         "fast_model": args.fast_model or os.getenv("LLAMA_FAST_MODEL_DIR", ""),
+        "qwen_model": args.qwen_model or os.getenv("QWEN_AUTOCOMPLETE_MODEL_DIR", ""),
+        "granite_fim_model": args.granite_fim_model or os.getenv("GRANITE_FIM_MODEL_DIR", ""),
+        "quality_baseline_label": args.quality_baseline_label,
+        "quality_candidate_label": args.quality_candidate_label,
         "config": config,
         "scenario_count": len(scenarios),
         "case_count": len(cases),
@@ -885,6 +1129,7 @@ def write_run_config(path: Path, args: argparse.Namespace, config: dict[str, Any
                 "scenario_id": case.scenario["id"],
                 "repetition": case.repetition,
                 "draft_model_label": case.draft_model_label,
+                "fast_path_mode": case.fast_path_mode,
                 "speculative_draft_tokens": case.speculative_draft_tokens,
                 "temperature": case.temperature,
                 "top_p": case.top_p,
@@ -910,14 +1155,16 @@ def print_case_header(index: int, total: int, case: BenchmarkCase) -> None:
 def print_case_result(row: dict[str, Any]) -> None:
     status = "error" if row["error"] else "ok"
     acceptance = safe_float(row["draft_acceptance_rate"])
+    quality = safe_float(row["quality_score"])
     acceptance_text = f"{acceptance * 100:.0f}%" if acceptance is not None else "n/a"
+    quality_text = f"{quality:.2f}" if quality is not None else "n/a"
     flags = row["quality_flags"] or "none"
     ttft_text = f"{row['ttft_ms']}ms" if row["ttft_ms"] not in ("", None) else "n/a"
     total_text = f"{row['total_ms']}ms" if row["total_ms"] not in ("", None) else "n/a"
     print(
         f"  {status} | ttft={ttft_text} | "
         f"total={total_text} | tps={row['tokens_per_second'] or 'n/a'} | "
-        f"acceptance={acceptance_text} | flags={flags}"
+        f"acceptance={acceptance_text} | quality={quality_text} | flags={flags}"
     )
     if row["error"]:
         print(f"  error={row['error']}")
@@ -966,6 +1213,13 @@ def run_benchmarks(args: argparse.Namespace) -> Path:
     write_summary_csv(output_dir / "summary.csv", summary_rows)
     plots = generate_plots(results_csv, output_dir)
     write_summary_md(output_dir / "summary.md", rows, summary_rows, plots)
+    if args.quality_baseline_label and args.quality_candidate_label:
+        maybe_write_quality_comparison(
+            output_dir=output_dir,
+            rows=rows,
+            baseline_label=args.quality_baseline_label,
+            candidate_label=args.quality_candidate_label,
+        )
 
     print(f"results_csv={results_csv}")
     print(f"summary_csv={output_dir / 'summary.csv'}")
@@ -984,6 +1238,13 @@ def plot_only(args: argparse.Namespace) -> Path:
     write_summary_csv(output_dir / "summary.csv", summary_rows)
     plots = generate_plots(results_csv, output_dir)
     write_summary_md(output_dir / "summary.md", rows, summary_rows, plots)
+    if args.quality_baseline_label and args.quality_candidate_label:
+        maybe_write_quality_comparison(
+            output_dir=output_dir,
+            rows=rows,
+            baseline_label=args.quality_baseline_label,
+            candidate_label=args.quality_candidate_label,
+        )
     print(f"plot_only=true")
     print(f"results_csv={results_csv}")
     print(f"plots_dir={output_dir / 'plots'}")
@@ -1003,9 +1264,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-1b-model", default=os.getenv("LLAMA_REWRITE_DRAFT_MODEL_DIR", ""))
     parser.add_argument("--draft-3b-model", default=os.getenv("LLAMA_FAST_MODEL_DIR", ""))
     parser.add_argument("--fast-model", default=os.getenv("LLAMA_FAST_MODEL_DIR", ""))
+    parser.add_argument("--qwen-model", default=os.getenv("QWEN_AUTOCOMPLETE_MODEL_DIR", ""))
+    parser.add_argument("--granite-fim-model", default=os.getenv("GRANITE_FIM_MODEL_DIR", ""))
+    parser.add_argument(
+        "--quality-baseline-label",
+        default="",
+        help="Baseline label for quality comparison output (e.g. draft_3b, qwen_fim).",
+    )
+    parser.add_argument(
+        "--quality-candidate-label",
+        default="",
+        help="Candidate label for quality comparison output (e.g. draft_1b, granite_fim).",
+    )
     parser.add_argument("--repetitions", type=int, default=None)
     parser.add_argument("--tasks", default="", help="Comma-separated subset: rewrite,autocomplete,correction")
     parser.add_argument("--draft-modes", default="", help="Comma-separated subset: target_only,draft_1b,draft_3b")
+    parser.add_argument(
+        "--fast-path-modes",
+        default="",
+        help="Comma-separated subset for autocomplete: llama_instruct,qwen_fim,granite_fim",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--mock", action="store_true")
