@@ -78,6 +78,13 @@ LLAMA_FAST_STOP_STRINGS = (
     "<|reserved_special_token",
     "\n",
 )
+LLAMA_CORRECTION_STOP_STRINGS = (
+    "<|eot_id|>",
+    "<|end_of_text|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|reserved_special_token",
+)
 AUTOCOMPLETE_CODE_PATTERNS = (
     "```",
     "import ",
@@ -446,7 +453,7 @@ def parse_correction_suggestions(
     segment_start: int,
     segment_text: str,
 ) -> list[CorrectionSuggestion]:
-    text = trim_at_stop_strings(raw_completion, LLAMA_FAST_STOP_STRINGS).strip()
+    text = trim_at_stop_strings(raw_completion, LLAMA_CORRECTION_STOP_STRINGS).strip()
     if not text:
         return []
     start_index = text.find("[")
@@ -576,7 +583,29 @@ class MockExLlamaEngine:
     ) -> list[CorrectionSuggestion]:
         if cancel_event.is_set():
             return []
-        return []
+
+        suggestions: list[CorrectionSuggestion] = []
+        patterns: list[tuple[str, str, CorrectionReason]] = [
+            (r"\bmanager were\b", "manager was", "grammar"),
+            (r"\bit contain\b", "it contains", "grammar"),
+            (r"\bseveral typo\b", "several typos", "typo"),
+            (r"\bfast it\b", "fast, it", "punctuation"),
+            (r"\bsuggestions which\b", "suggestions, which", "punctuation"),
+            (r"\bpunctuation$", "punctuation.", "punctuation"),
+        ]
+        for pattern, replacement, reason in patterns:
+            match = re.search(pattern, document_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            suggestions.append(
+                {
+                    "start": match.start(),
+                    "end": match.end(),
+                    "replacement": replacement,
+                    "reason": reason,
+                }
+            )
+        return suggestions[:5]
 
     def apply_rewrite(
         self,
@@ -1102,7 +1131,7 @@ class RealExLlamaEngine:
         raw_completion = ""
         try:
             with self.gpu_lock, self.torch.inference_mode():
-                self.fast_generator.set_stop_conditions(self._llama_fast_stop_conditions())
+                self.fast_generator.set_stop_conditions(self._llama_correction_stop_conditions())
                 self.fast_generator.begin_stream_ex(
                     input_ids,
                     self.fast_sampling_settings,
@@ -1178,7 +1207,7 @@ class RealExLlamaEngine:
                     telemetry.observe_chunk(chunk, self._result_token_count(result))
                 if result.get("eos", False):
                     break
-                if "<|eot_id|>" in raw_completion or "<|end_of_text|>" in raw_completion:
+                if any(stop in raw_completion for stop in LLAMA_CORRECTION_STOP_STRINGS):
                     break
             return parse_correction_suggestions(
                 raw_completion,
@@ -1777,6 +1806,18 @@ class RealExLlamaEngine:
     def _llama_fast_stop_conditions(self) -> list[Any]:
         assert self.fast_llama is not None
         stop_conditions: list[Any] = list(LLAMA_FAST_STOP_STRINGS)
+        eos_token_id = getattr(self.fast_llama.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, (list, tuple, set)):
+                stop_conditions.extend(eos_token_id)
+            else:
+                stop_conditions.append(eos_token_id)
+        stop_conditions.extend(LLAMA3_STOP_TOKEN_IDS)
+        return stop_conditions
+
+    def _llama_correction_stop_conditions(self) -> list[Any]:
+        assert self.fast_llama is not None
+        stop_conditions: list[Any] = list(LLAMA_CORRECTION_STOP_STRINGS)
         eos_token_id = getattr(self.fast_llama.tokenizer, "eos_token_id", None)
         if eos_token_id is not None:
             if isinstance(eos_token_id, (list, tuple, set)):

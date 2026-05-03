@@ -1,0 +1,68 @@
+[
+  {
+    "id": "rewrite_short_professional",
+    "task": "rewrite",
+    "name": "Short professional rewrite",
+    "text": "Hey Sam, I looked at the thing and it seems mostly fine but some parts are kind of confusing.",
+    "instruction": "Make this sound more professional and concise."
+  },
+  {
+    "id": "rewrite_long_ai_ethics",
+    "task": "rewrite",
+    "name": "Long AI ethics paragraph",
+    "text": "The rapid development of artificial intelligence has changed how people use technology, creating better productivity and new ethical problems. Many organizations use AI tools to simplify routine work and decisions, but the risks of depending too much on automated systems remain controversial. Critics argue that too much reliance on automation can reduce human oversight and lead to unexpected outcomes in healthcare and finance. Supporters argue that AI can process large datasets accurately and enable discoveries that were once impossible. Finding the right balance between using AI and keeping human accountability is therefore important.",
+    "instruction": "Rewrite this as a polished academic paragraph while preserving the meaning."
+  },
+  {
+    "id": "rewrite_instruction_heavy",
+    "task": "rewrite",
+    "name": "Instruction-heavy rewrite",
+    "text": "Our launch was delayed because the integration was unstable, the documentation was incomplete, and several stakeholders changed requirements near the end.",
+    "instruction": "Rewrite for an executive update. Keep it factual, avoid blame, and make the risk sound manageable."
+  },
+  {
+    "id": "rewrite_grammar_repair",
+    "task": "rewrite",
+    "name": "Grammar repair rewrite",
+    "text": "The team have finished most of the migration but there is still several issues that needs review before we can release it.",
+    "instruction": "Fix grammar and make the sentence clear without changing the meaning."
+  },
+  {
+    "id": "autocomplete_paragraph_end",
+    "task": "autocomplete",
+    "name": "Autocomplete at paragraph end",
+    "document_text": "The research team evaluated the deployment risks and concluded that the safest next step was",
+    "cursor": 88,
+    "reference_completions": [
+      "to pause the rollout.",
+      "to delay the rollout.",
+      "to proceed cautiously."
+    ]
+  },
+  {
+    "id": "autocomplete_mid_sentence",
+    "task": "autocomplete",
+    "name": "Autocomplete mid sentence",
+    "document_text": "The committee approved the revised policy because  would reduce operational uncertainty for regional teams.",
+    "cursor": 47,
+    "reference_completions": [
+      "it",
+      "the change",
+      "the update"
+    ]
+  },
+  {
+    "id": "correction_typos_grammar",
+    "task": "correction",
+    "name": "Typos and grammar correction",
+    "document_text": "The manager were happy with the report, but it contain several typo and missing punctuation",
+    "cursor": 83
+  },
+  {
+    "id": "correction_clarity_punctuation",
+    "task": "correction",
+    "name": "Clarity and punctuation correction",
+    "document_text": "Although the system is fast it sometimes returns unclear suggestions which means reviewers must check the output carefully",
+    "cursor": 112
+  }
+]

@@ -1,4 +1,5 @@
 from engine import (
+    MockExLlamaEngine,
     build_llama_autocomplete_prompt,
     build_llama_rewrite_prompt,
     build_qwen_fim_prompt,
@@ -113,6 +114,18 @@ def test_parse_correction_suggestions_validates_and_shifts_offsets() -> None:
     ]
 
 
+def test_parse_correction_suggestions_accepts_multiline_json() -> None:
+    raw = """
+[
+  {"start": 4, "end": 7, "replacement": "are", "reason": "grammar"}
+]
+"""
+
+    assert parse_correction_suggestions(raw, 0, "You is kind") == [
+        {"start": 4, "end": 7, "replacement": "are", "reason": "grammar"}
+    ]
+
+
 def test_parse_correction_suggestions_rejects_malformed_json() -> None:
     assert parse_correction_suggestions("not json", 0, "You is kind") == []
     assert (
@@ -123,3 +136,15 @@ def test_parse_correction_suggestions_rejects_malformed_json() -> None:
         )
         == []
     )
+
+
+def test_mock_engine_correction_path_returns_obvious_suggestions() -> None:
+    engine = MockExLlamaEngine()
+    suggestions = engine.generate_corrections(
+        "The manager were happy with the report, but it contain several typo and missing punctuation",
+        83,
+        cancel_event=type("CancelEvent", (), {"is_set": lambda self: False})(),
+    )
+
+    replacements = {suggestion["replacement"] for suggestion in suggestions}
+    assert {"manager was", "it contains", "several typos", "punctuation."} <= replacements
